@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>UV 标定 v2</title>
+<style>
+  body{margin:0;overflow:hidden;background:#0b1120;font-family:ui-monospace,monospace;}
+  #i{position:fixed;top:8px;left:8px;color:#4ade80;font-size:12px;z-index:9;}
+  #e{position:fixed;top:28px;left:8px;color:#f87171;font-size:12px;z-index:9;}
+</style>
+<script type="importmap">
+{"imports":{"three":"/wraps3d/lib/three.module.js","three/addons/":"/wraps3d/lib/"}}
+</script>
+</head>
+<body>
+<div id="i">加载中…</div>
+<div id="e"></div>
+<script type="module">
+import * as THREE from '/wraps3d/lib/three.module.js';
+import { GLTFLoader } from '/wraps3d/lib/loaders/GLTFLoader.js';
+import { OrbitControls } from '/wraps3d/lib/controls/OrbitControls.js';
+const info = document.getElementById('i');
+const errEl = document.getElementById('e');
+window.addEventListener('error', e => { errEl.textContent = 'JS: ' + e.message; });
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1120);
+const camera = new THREE.PerspectiveCamera(40, innerWidth/innerHeight, 0.1, 200);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.AmbientLight(0xffffff, 1.3));
+const d = new THREE.DirectionalLight(0xffffff, 2); d.position.set(5, 8, 6); scene.add(d);
+const controls = new OrbitControls(camera, renderer.domElement);
+// 四象限：1上左红 2上右绿 3下左蓝 4下右黄
+const cv = document.createElement('canvas'); cv.width = 1024; cv.height = 1024;
+const g = cv.getContext('2d');
+g.fillStyle = '#e33'; g.fillRect(0, 0, 512, 512);
+g.fillStyle = '#3a3'; g.fillRect(512, 0, 512, 512);
+g.fillStyle = '#36c'; g.fillRect(0, 512, 512, 512);
+g.fillStyle = '#fc3'; g.fillRect(512, 512, 512, 512);
+g.fillStyle = '#fff'; g.font = 'bold 140px sans-serif';
+g.fillText('1', 200, 300); g.fillText('2', 700, 300);
+g.fillText('3', 200, 820); g.fillText('4', 700, 820);
+const tex = new THREE.Texture(cv);
+tex.flipY = false;
+tex.colorSpace = THREE.SRGBColorSpace;
+tex.needsUpdate = true;
+new GLTFLoader().load('models/ModelY_High_slim.glb?v=uv2', (gltf) => {
+  const car = gltf.scene;
+  const box = new THREE.Box3().setFromObject(car);
+  const c = box.getCenter(new THREE.Vector3());
+  car.position.sub(c);
+  let n = 0;
+  car.traverse(o => {
+    if (!o.isMesh) return;
+    const ms = Array.isArray(o.material) ? o.material : [o.material];
+    ms.forEach(m => { if (/^Paint/i.test(m.name)) { m.map = tex; m.color = new THREE.Color(0xffffff); m.needsUpdate = true; n++; } });
+  });
+  scene.add(car);
+  info.textContent = 'Paint ' + n + ' | flipY=false';
+  camera.position.set(4.6, 2.2, 5.6);
+  controls.target.set(0, 0.6, 0);
+  (function loop(){ requestAnimationFrame(() => { controls.update(); renderer.render(scene, camera); loop(); }); })();
+}, undefined, (e) => { errEl.textContent = 'ERR ' + (e.message || e); });
+</script>
+</body>
+</html>

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>自研 3D 验证 — 官方UV对齐测试</title>
+<style>
+  body{margin:0;overflow:hidden;background:#0b1120;font-family:-apple-system,"PingFang SC",sans-serif;}
+  #info{position:fixed;top:10px;left:10px;color:#4ade80;font-size:13px;z-index:9;text-shadow:0 1px 2px #000;}
+  #err{position:fixed;top:32px;left:10px;color:#f87171;font-size:12px;z-index:9;}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="info">自研验证：ModelY_High.glb + 官方 modely 模板贴图 → Paint 材质</div>
+<div id="err"></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const errEl = document.getElementById('err');
+window.addEventListener('error', e => { errEl.textContent = '错误: ' + e.message; });
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1120);
+const camera = new THREE.PerspectiveCamera(40, innerWidth/innerHeight, 0.1, 200);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(5, 8, 6); scene.add(key);
+const fill = new THREE.DirectionalLight(0xdde7ff, 0.9); fill.position.set(-6, 4, -5); scene.add(fill);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+// 官方 modely 模板作为车漆贴图（UV 对齐验证的关键）
+const texLoader = new THREE.TextureLoader();
+const wrapTex = texLoader.load('/wraps/modely.png', t => { t.colorSpace = THREE.SRGBColorSpace; t.needsUpdate = true; });
+wrapTex.colorSpace = THREE.SRGBColorSpace;
+wrapTex.flipY = false; // glTF UV 约定
+
+new GLTFLoader().load('models/ModelY_High_slim.glb', (gltf) => {
+  const car = gltf.scene;
+  // 居中
+  const box = new THREE.Box3().setFromObject(car);
+  const center = box.getCenter(new THREE.Vector3());
+  car.position.sub(center);
+  scene.add(car);
+
+  let painted = 0, mats = [];
+  car.traverse(o => {
+    if (o.isMesh) {
+      const ms = Array.isArray(o.material) ? o.material : [o.material];
+      ms.forEach(m => {
+        if (!m.name) return;
+        // 车漆材质：Paint / PaintRough / PaintFade（换肤系统的作用面）
+        if (/^Paint/i.test(m.name)) {
+          m.map = wrapTex;
+          m.color = new THREE.Color(0xffffff);
+          m.needsUpdate = true;
+          painted++;
+          mats.push(m.name);
+        }
+      });
+    }
+  });
+  document.getElementById('info').textContent =
+    '已加载。车漆材质替换 ' + painted + ' 个: [' + mats.join(', ') + ']';
+
+  // 相机：斜前方
+  camera.position.set(6, 2.6, 7);
+  controls.target.set(0, 0.6, 0);
+  controls.update();
+  (function loop(){ requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+}, (ev) => {
+  if (ev.total) errEl.textContent = '模型加载 ' + Math.round(ev.loaded/ev.total*100) + '%';
+}, (e) => {
+  errEl.textContent = 'GLB加载失败: ' + (e.message || e);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>UV Lab 2 — 官方模板UV验证</title>
+<style>
+  html,body{margin:0;height:100%;background:#15151c;overflow:hidden;font-family:system-ui,sans-serif}
+  #c{width:100%;height:100%;display:block;touch-action:none}
+  #bar{position:fixed;top:8px;left:50%;transform:translateX(-50%);display:flex;gap:8px;z-index:9}
+  #bar button{padding:8px 14px;border:0;border-radius:8px;background:#2c2c38;color:#eee;font-size:14px}
+  #bar button.on{background:#3d6dff}
+  #hud{position:fixed;left:8px;bottom:8px;color:#9aa;font-size:12px;z-index:9;white-space:pre-line}
+  #file{display:none}
+</style>
+<script type="importmap">
+{"imports":{"three":"/wraps3d/lib/three.module.js?v=uv2","three/addons/":"/wraps3d/lib/"}}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="bar">
+  <button data-tex="/wraps3d/models/label_modely_t.png" class="on">分区标注</button>
+  <button data-tex="/wraps3d/models/mcqueen_t.png">麦克昆</button>
+  <button data-tex="/wraps3d/models/modely_t.png">官方模板</button>
+  <button id="pick">本地图片</button>
+  <input id="file" type="file" accept="image/*">
+  <input id="paint" type="color" value="#f8fafc" title="车漆色（未贴膜部位显示此色）">
+  <button id="trycolor">分区试色</button>
+</div>
+<div id="rpanel" style="display:none;position:fixed;top:52px;left:50%;transform:translateX(-50%);z-index:9;background:#1d1d28;padding:8px 10px;border-radius:10px;max-width:96vw">
+  <div style="color:#9aa;font-size:12px;margin-bottom:6px">点一个区域上色 → 看它落在车上哪里。再点一次取消。全部空白 = 清除。</div>
+  <div id="rbtns" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+</div>
+<div id="hud">加载中…</div>
+<script>
+window.addEventListener('error', function(e){
+  document.getElementById('hud').textContent = 'LOAD-ERR: ' + (e.message || e.filename || 'unknown');
+});
+window.addEventListener('unhandledrejection', function(e){
+  document.getElementById('hud').textContent = 'REJ: ' + e.reason;
+});
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const hud = document.getElementById('hud');
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x15151c);
+const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+camera.position.set(4.6, 1.9, 5.4);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 0.75, 0);
+controls.enableDamping = true;
+window.__orbit = controls; window.__cam = camera;   // 调试把手
+window.__THREE = THREE;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x333344, 1.15));
+const dir = new THREE.DirectionalLight(0xffffff, 1.6);
+dir.position.set(5, 8, 4);
+scene.add(dir);
+const dir2 = new THREE.DirectionalLight(0xffffff, 0.5);
+dir2.position.set(-6, 4, -5);
+scene.add(dir2);
+const grid = new THREE.GridHelper(20, 40, 0x333344, 0x222230);
+scene.add(grid);
+
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+const texCache = {};
+let paintColor = '#f8fafc';
+let paintHex = paintColor;
+let curTex = '/wraps3d/models/label_modely_t.png';
+let tryMode = false;
+let idData = null;                      // region id map pixels
+const activeRegions = new Set();
+const REGIONS = [[2, '机盖'], [3, '前保'], [4, '尾门'], [5, '左前门'], [6, '右前门'],
+  [7, '左后门'], [8, '右后门'], [9, '后保'], [10, '右前翼'], [11, '左前翼'],
+  [12, '右后翼'], [13, '左后翼'], [14, '左ABC柱'], [15, '右ABC柱'], [16, '右镜'], [17, '左镜']];
+const RCOLOR = {2:'#4a90e2',3:'#50c878',4:'#f5c542',5:'#b28ff0',6:'#40c9c9',7:'#ff8ac2',
+  8:'#b5e661',9:'#8c8ce6',10:'#ffa050',11:'#e6e66e',12:'#6ee6aa',13:'#e6966e',
+  14:'#9696ff',15:'#c86eb4',16:'#8cd28c',17:'#ff7878'};
+
+// persistent compose canvas: design textures and 试色 both render here
+const composeCv = document.createElement('canvas');
+composeCv.width = 1024; composeCv.height = 1024;
+const composeCx = composeCv.getContext('2d');
+
+function composeTry(){
+  if (!idData) return;
+  composeCx.fillStyle = paintHex;
+  composeCx.fillRect(0, 0, 1024, 1024);
+  const im = composeCx.getImageData(0, 0, 1024, 1024);
+  const d = im.data, s = idData.data;
+  for (let i = 0; i < 1024 * 1024; i++){
+    const rid = Math.round(s[i * 4] / 15);
+    if (rid >= 1 && activeRegions.has(rid)){
+      const c = RCOLOR[rid] || '#ff00ff';
+      d[i * 4]     = parseInt(c.slice(1, 3), 16);
+      d[i * 4 + 1] = parseInt(c.slice(3, 5), 16);
+      d[i * 4 + 2] = parseInt(c.slice(5, 7), 16);
+      d[i * 4 + 3] = 255;
+    }
+  }
+  composeCx.putImageData(im, 0, 0);
+}
+
+function composeDesign(imgEl){
+  composeCx.fillStyle = paintHex;
+  composeCx.fillRect(0, 0, 1024, 1024);
+  composeCx.drawImage(imgEl, 0, 0, 1024, 1024);
+}
+
+function applyTexture(src){
+  if (tryMode){ applyComposed(); hud.textContent = '分区试色中（勾选区域上色）'; return; }
+  curTex = src;
+  const done = (tex) => {
+    wrapMat.map = tex;
+    wrapMat.color.set(0xffffff);
+    wrapMat.roughness = 0.38; wrapMat.metalness = 0.05;
+    wrapMat.needsUpdate = true;
+    hud.textContent = '贴图: ' + src;
+  };
+  const key = src + '|' + paintColor;
+  if (texCache[key]) return done(texCache[key]);
+  new THREE.TextureLoader().load(src + (src.includes('?') ? '&' : '?') + 'v=' + Date.now(), (img) => {
+    composeDesign(img.image);
+    const tex = new THREE.CanvasTexture(composeCv);
+    tex.flipY = false;               // glTF UV convention
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.channel = 1;                 // 官方 UV2 = TEXCOORD_1
+    tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    texCache[key] = tex;
+    done(tex);
+  }, undefined, (e) => { hud.textContent = '贴图加载失败: ' + src; });
+}
+
+let liveTex = null;
+function applyComposed(){
+  if (!liveTex){
+    liveTex = new THREE.CanvasTexture(composeCv);
+    liveTex.flipY = false;
+    liveTex.colorSpace = THREE.SRGBColorSpace;
+    liveTex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  }
+  liveTex.channel = 1;
+  liveTex.needsUpdate = true;
+  wrapMat.map = liveTex; wrapMat.color.set(0xffffff);
+  wrapMat.roughness = 0.38; wrapMat.metalness = 0.05;
+  wrapMat.needsUpdate = true;
+}
+
+let model = null;
+// 官方 tscn 接线：PaintSkybox=贴膜层(UV1)、Exterior=官方贴图壳(UV0)、Paint_Rough=哑光漆
+const WRAP_PRIMS = {Body:[1], Hood:[0], Trunk:[2], Door_LF:[1], Door_RF:[1],
+  Door_LR:[1], Door_RR:[1], Door_LF_Mirror:[1], Door_RF_Mirror:[1]};
+const EXT_PRIMS = {Body:[0], Hood:[1], Trunk:[0], Door_LF:[0], Door_RF:[0],
+  Door_LR:[0], Door_RR:[0], Door_LF_Mirror:[0], Door_RF_Mirror:[0]};
+const ROUGH_PRIMS = {Body:[4], Trunk:[4], Door_LF:[2], Door_RF:[2], Door_LR:[2], Door_RR:[2]};
+const HIDE_MESH = new Set(['Floor', 'Headlights_Projections', 'Taillights_Projection']);
+const LAMPF_RE = /^(Headlights|DRL|Fog_Lights_Front|Foglights_Cover|Headlights_Trunk|Left_Turn_Signal|Right_Turn_Signal|Lights)$/;
+const LAMPR_RE = /^(Brake_Lights_Center|Brake_Lights_Left|Brake_Lights_Right|Brake_Lights_GLOBAL|Reverse_Lights|Fog_Lights_Rear_GLOBAL|Lights_Trunk)$/;
+const INTERIOR_RE = /^(Interior_|Seat_|Dashboard|Center_Console|Steering_Wheel|Screen_Front|Doorcard_|Trunk_Card)/;
+const GLASS_RE = /^(Window_LF|Window_RF|Window_LR|Window_RR|Windows_Rear|Windows_Top|Lights_Glass|Lights_Glass_Trunk)$/;
+const glassMat = new THREE.MeshStandardMaterial({color: 0x0d1218, transparent: true, opacity: 0.55,
+  roughness: 0.06, metalness: 0.2, side: THREE.DoubleSide});
+const interiorMat = new THREE.MeshStandardMaterial({color: 0x232529, roughness: 0.85});
+const tireMat = new THREE.MeshStandardMaterial({color: 0x0c0d0f, roughness: 0.95});
+const rimMat = new THREE.MeshStandardMaterial({color: 0xcfd4da, roughness: 0.35, metalness: 0.35});
+const rotorMat = new THREE.MeshStandardMaterial({color: 0xb9bcbf, roughness: 0.45, metalness: 0.9});
+const caliperMat = new THREE.MeshStandardMaterial({color: 0xffffff, roughness: 0.4, metalness: 0.3});
+const extShellMat = new THREE.MeshStandardMaterial({color: paintHex, roughness: 0.35, metalness: 0.08, side: THREE.DoubleSide});
+const roughPaintMat = new THREE.MeshStandardMaterial({color: paintHex, roughness: 0.62, metalness: 0.0, side: THREE.DoubleSide});
+const wrapMat = new THREE.MeshStandardMaterial({color: 0xffffff, roughness: 0.38, metalness: 0.05,
+  side: THREE.DoubleSide});
+const lampMat = new THREE.MeshStandardMaterial({color: 0x50565c, roughness: 0.35, metalness: 0.2});
+// 官方贴图（UV0 通道）
+const TEX_BASE = '/wraps3d/models/tex/';
+function loadTex(name){
+  const t = new THREE.TextureLoader().load(TEX_BASE + name + '?v=ofuv5');
+  t.flipY = false;
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  t.channel = 0;
+  return t;
+}
+extShellMat.map = loadTex('Exterior_BC_Y_High.png');
+extShellMat.needsUpdate = true;
+lampMat.map = loadTex('Lights_BC_Y_High.png');
+lampMat.emissiveMap = lampMat.map;
+lampMat.needsUpdate = true;
+caliperMat.map = loadTex('Brakes_Std_BC.png');
+caliperMat.needsUpdate = true;
+addEventListener('error', e => { hud.textContent = '页面错误: ' + e.message; });
+addEventListener('unhandledrejection', e => { hud.textContent = 'Promise错误: ' + e.reason; });
+const loader = new GLTFLoader();
+hud.textContent = '开始加载模型…';
+const t0 = performance.now();
+loader.load('/wraps3d/models/ModelY_High_ofuv5.glb?v=ofuv5c', (gltf) => {
+  model = gltf.scene;
+  // 用 parser.associations 拿真实 (mesh, primitive) 序号——
+  // 不能靠名字：node 先占用 'Door_LF'，网格名会整体错位 +1（Door_LF_1 才是 prim0）
+  const assoc = gltf.parser.associations;
+  const jmeshes = gltf.parser.json.meshes;
+  const jnames = jmeshes.map(m => (m && m.name) || '');
+  const globalHide = new Set(jnames.filter(nm => nm.endsWith('_GLOBAL') && jnames.includes(nm.slice(0, -7))));
+  let nWrap = 0, nExt = 0;
+  model.traverse(o => {
+    if (!o.isMesh) return;
+    if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+    const a = assoc.get(o) || {};
+    const mi = a.meshes;
+    if (mi === undefined) return;
+    const base = jnames[mi] || ('mesh' + mi);
+    const pidx = a.primitives || 0;
+    if (HIDE_MESH.has(base) || globalHide.has(base)){
+      o.visible = false; return;
+    }
+    if (base === 'WheelGemini'){ o.material = (pidx === 0) ? rimMat : tireMat; return; }
+    if (base === 'BrakeF' || base === 'BrakeR'){ o.material = (pidx === 0) ? caliperMat : rotorMat; return; }
+    if (GLASS_RE.test(base)){ o.material = glassMat; return; }
+    if (LAMPF_RE.test(base) || LAMPR_RE.test(base)){ o.material = lampMat; return; }
+    if (INTERIOR_RE.test(base)){ o.material = interiorMat; return; }
+    if ((WRAP_PRIMS[base] || []).includes(pidx)){ o.material = wrapMat; nWrap++; return; }
+    if ((EXT_PRIMS[base] || []).includes(pidx)){ o.material = extShellMat; nExt++; return; }
+    if ((ROUGH_PRIMS[base] || []).includes(pidx)){ o.material = roughPaintMat; return; }
+    o.material = extShellMat;
+  });
+  scene.add(model);
+  window.__model = model;   // 调试把手
+  hud.textContent = `模型已加载 官方材质模式 贴膜层${nWrap} 官方壳${nExt} (用时${Math.round(performance.now() - t0)}ms)`;
+  applyTexture(curTex);
+}, (ev) => {
+  hud.textContent = '模型加载 ' + ev.loaded + ' / ' + (ev.total || '?');
+}, (e) => { hud.textContent = '模型加载失败: ' + e; });
+
+document.querySelectorAll('#bar button[data-tex]').forEach(b => {
+  b.addEventListener('click', () => {
+    tryMode = false;
+    document.getElementById('trycolor').classList.remove('on');
+    document.getElementById('rpanel').style.display = 'none';
+    document.querySelectorAll('#bar button').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    applyTexture(b.dataset.tex);
+  });
+});
+document.getElementById('paint').addEventListener('input', (e) => {
+  paintHex = e.target.value;
+  extShellMat.color.set(paintHex);
+  roughPaintMat.color.set(paintHex);
+  if (tryMode){ composeTry(); applyComposed(); } else { applyTexture(curTex); }
+});
+// ---- 分区试色 ----
+const rpanel = document.getElementById('rpanel');
+const rbtns = document.getElementById('rbtns');
+const idCv = document.createElement('canvas'); idCv.width = 1024; idCv.height = 1024;
+new THREE.TextureLoader().load('/wraps3d/models/region_idmap.png', (img) => {
+  const cx2 = idCv.getContext('2d', { willReadFrequently: true }); cx2.drawImage(img.image, 0, 0);
+  idData = cx2.getImageData(0, 0, 1024, 1024);
+  if (tryMode){ composeTry(); applyComposed(); }
+});
+for (const [rid, name] of REGIONS){
+  const b = document.createElement('button');
+  b.textContent = name + rid;
+  b.style.background = '#2c2c38';
+  b.addEventListener('click', () => {
+    if (activeRegions.has(rid)) activeRegions.delete(rid); else activeRegions.add(rid);
+    b.style.background = activeRegions.has(rid) ? (RCOLOR[rid] || '#3d6dff') : '#2c2c38';
+    if (tryMode && idData){ composeTry(); applyComposed(); }
+  });
+  rbtns.appendChild(b);
+}
+document.getElementById('trycolor').addEventListener('click', () => {
+  tryMode = !tryMode;
+  document.getElementById('trycolor').classList.toggle('on', tryMode);
+  rpanel.style.display = tryMode ? 'block' : 'none';
+  if (tryMode){
+    if (!idData){ hud.textContent = '区域图加载中，稍候再点'; return; }
+    composeTry(); applyComposed();
+    hud.textContent = '分区试色中：点上方区域按钮上色';
+  } else {
+    applyTexture(curTex);
+  }
+});
+document.getElementById('pick').addEventListener('click', () => document.getElementById('file').click());
+document.getElementById('file').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  document.querySelectorAll('#bar button').forEach(x => x.classList.remove('on'));
+  document.getElementById('pick').classList.add('on');
+  applyTexture(url);
+});
+
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>

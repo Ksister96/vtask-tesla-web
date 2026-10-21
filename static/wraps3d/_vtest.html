@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<script type="importmap">{"imports":{"three":"/wraps3d/lib/three.module.js?v=61b","three/addons/":"/wraps3d/lib/"}}</script>
+<title>工坊 viewer 六车验证</title>
+<style>
+  html,body{margin:0;height:100%;background:#101a2e;overflow:hidden;font-family:system-ui}
+  #v{position:absolute;inset:0}
+  #top{position:fixed;top:8px;left:50%;transform:translateX(-50%);display:flex;gap:8px;flex-wrap:wrap;z-index:9}
+  #top button{padding:8px 14px;border:0;border-radius:8px;background:#2c3a4d;color:#eee;font-size:13px;cursor:pointer}
+  #top button.on{background:#3d6dff}
+  #name{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);color:#fff;font-size:16px;z-index:9;background:rgba(0,0,0,.55);padding:6px 14px;border-radius:8px}
+</style>
+</head>
+<body>
+<div id="top"></div>
+<div id="name">…</div>
+<script>window.addEventListener('error', function(e){ var n = document.getElementById('name'); if (n) n.textContent = 'ERR ' + (e.message || e.filename || 'unknown'); });</script>
+<div id="v"></div>
+<script type="module">
+import { createWrapViewer } from '/wraps3d/viewer.js?v=m3h6';
+const CARS = [
+  ['modely', '老款 Model Y'],
+  ['model3', '老款 Model 3'],
+  ['model3-2024-base', '新款 Model 3'],
+  ['model3-2024-performance', '新款 3P'],
+  ['modely-2025-base', '新款 Model Y'],
+  ['modely-l', 'Model Y L'],
+];
+const top = document.getElementById('top');
+const nameEl = document.getElementById('name');
+const v = createWrapViewer(document.getElementById('v'));
+v.setBg(true);
+let cur = null;
+async function go(key, label) {
+  for (const b of top.children) b.classList.toggle('on', b.textContent === label);
+  nameEl.textContent = 'loading ' + label + '…';
+  await v.open(key, null);
+  nameEl.textContent = label;
+}
+for (const [key, label] of CARS) {
+  const b = document.createElement('button');
+  b.textContent = label;
+  b.addEventListener('click', () => go(key, label));
+  top.appendChild(b);
+}
+const qs = new URLSearchParams(location.search).get('car') || 'modely';
+for (const [key, label] of CARS) {
+  if (key === qs) { go(key, label).then(() => {}); break; }
+}
+window.__go = go;
+window.__v = v;
+window.addEventListener('error', e => { document.getElementById('name').textContent = 'ERR ' + e.message; });
+window.addEventListener('unhandledrejection', e => { document.getElementById('name').textContent = 'REJ ' + (e.reason && e.reason.message || ''); });
+</script>
+</body>
+</html>

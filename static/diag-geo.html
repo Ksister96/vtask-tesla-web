@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>定位自检 · V-TASK</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;padding:18px 16px 40px;background:#0b1220;color:#e6edf7;
+       font:15px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}
+  h1{font-size:19px;margin:0 0 4px}
+  .sub{color:#8ba0bd;font-size:13px;margin-bottom:18px}
+  .card{background:#131c2e;border:1px solid #24304a;border-radius:12px;padding:14px;margin-bottom:12px}
+  .k{color:#8ba0bd;font-size:12.5px;margin-bottom:3px}
+  .v{font-size:15px;word-break:break-all;font-weight:600}
+  .ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}
+  button{width:100%;padding:14px;border:0;border-radius:11px;font-size:16px;font-weight:600;
+         background:#3b82f6;color:#fff;margin-top:6px}
+  button:active{opacity:.85}
+  pre{background:#0a0f1a;border:1px solid #1e293b;border-radius:9px;padding:11px;
+      font-size:12px;overflow:auto;white-space:pre-wrap;color:#a8c0dd;margin:8px 0 0}
+  .tip{background:#1a2338;border-left:3px solid #fbbf24;padding:11px 12px;border-radius:8px;
+       font-size:13.5px;color:#d6e2f5;margin-top:10px;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>定位自检</h1>
+<div class="sub">把这一页的结果截图发回即可，不需要自己判断。</div>
+
+<div class="card">
+  <div class="k">运行环境</div>
+  <div class="v" id="env">检测中…</div>
+</div>
+
+<div class="card">
+  <div class="k">Geolocation API</div>
+  <div class="v" id="api">检测中…</div>
+</div>
+
+<div class="card">
+  <div class="k">系统权限状态（permissions.query）</div>
+  <div class="v" id="perm">检测中…</div>
+</div>
+
+<div class="card">
+  <div class="k">实际定位测试</div>
+  <div class="v" id="res">尚未开始</div>
+  <button id="go">开始定位测试</button>
+  <div id="tipbox"></div>
+</div>
+
+<div class="card">
+  <div class="k">原始数据</div>
+  <pre id="raw">-</pre>
+</div>
+
+<script>
+var out = {};
+function set(id, txt, cls){
+  var e = document.getElementById(id);
+  e.textContent = txt;
+  e.className = 'v' + (cls ? ' ' + cls : '');
+}
+
+// 1. 环境
+(function(){
+  var standalone = (window.matchMedia && matchMedia('(display-mode: standalone)').matches)
+                   || window.navigator.standalone === true;
+  var secure = !!window.isSecureContext;
+  out.standalone = standalone;
+  out.secure = secure;
+  out.ua = navigator.userAgent;
+  out.protocol = location.protocol;
+  out.host = location.host;
+  var mode = standalone ? 'PWA（主屏幕图标）' : '浏览器页面';
+  set('env', mode + ' ｜ ' + (secure ? 'HTTPS 安全上下文 ✓' : '非安全上下文 ✗'),
+      secure ? 'ok' : 'bad');
+})();
+
+// 2. API 存在性
+(function(){
+  var has = !!navigator.geolocation;
+  out.hasGeo = has;
+  set('api', has ? '存在 ✓' : '不存在 ✗', has ? 'ok' : 'bad');
+})();
+
+// 3. permissions.query
+(function(){
+  var el = document.getElementById('perm');
+  if(!navigator.permissions || !navigator.permissions.query){
+    set('perm', '此浏览器不支持 permissions.query（iOS 常见）', 'warn');
+    out.permQuery = 'unsupported';
+    return;
+  }
+  navigator.permissions.query({name:'geolocation'}).then(function(st){
+    out.permQuery = st.state;
+    var map = {granted:'已授权 granted', prompt:'未决定 prompt', denied:'已拒绝 denied'};
+    set('perm', map[st.state] || st.state,
+        st.state === 'granted' ? 'ok' : (st.state === 'denied' ? 'bad' : 'warn'));
+    st.onchange = function(){ location.reload(); };
+  }).catch(function(e){
+    out.permQuery = 'error: ' + (e && e.message);
+    set('perm', '查询失败：' + (e && e.message), 'warn');
+  });
+})();
+
+// 4. 实际定位
+document.getElementById('go').onclick = function(){
+  if(!navigator.geolocation){ set('res','不支持定位','bad'); return; }
+  set('res','正在定位…（最多等 15 秒）','warn');
+  var done = false;
+  var t = setTimeout(function(){
+    if(done) return; done = true;
+    set('res','超时：15 秒内没有返回结果','bad');
+    showTip('code: 3（超时兜底）\n\n说明系统没有回应定位请求——通常是被系统拒绝了但没报错。');
+  }, 15000);
+
+  navigator.geolocation.getCurrentPosition(function(pos){
+    if(done) return; done = true; clearTimeout(t);
+    out.ok = true;
+    out.lat = pos.coords.latitude;
+    out.lon = pos.coords.longitude;
+    out.acc = pos.coords.accuracy;
+    set('res','定位成功 ✓ 精度 ' + Math.round(pos.coords.accuracy||0) + ' 米','ok');
+    showTip('定位正常，说明权限没问题。如果 App 里还是用不了，那就是 App 代码的问题，交给我。');
+    dump();
+  }, function(err){
+    if(done) return; done = true; clearTimeout(t);
+    out.ok = false;
+    out.errCode = err.code;
+    out.errMsg = err.message;
+    var names = {1:'PERMISSION_DENIED（权限被拒绝）', 2:'POSITION_UNAVAILABLE（拿不到位置）', 3:'TIMEOUT（超时）'};
+    set('res','定位失败 ✗  ' + (names[err.code] || err.code) + '', 'bad');
+    var tip = '';
+    if(err.code === 1){
+      tip = '系统拒绝了定位权限。\n\niPhone 上请这样改：\n'
+          + '设置 → 隐私与安全性 → 定位服务\n'
+          + '→ 在列表里找「微特 V-TASK」\n'
+          + '→ 选「使用App期间」并打开「精确位置」\n\n'
+          + '如果列表里找不到「微特 V-TASK」：\n'
+          + '先删除主屏幕图标 → 用 Safari 重新打开本网址 → 允许定位一次 → 再添加到主屏幕。\n\n'
+          + '注意：iOS 一旦拒绝过，网页端不会再弹窗，必须去设置里手动开。';
+    } else if(err.code === 2){
+      tip = '系统定位服务本身没打开，或信号不可用。\n\n'
+          + '请确认：设置 → 隐私与安全性 → 定位服务 → 总开关是打开的。';
+    } else if(err.code === 3){
+      tip = '定位超时。\n\n可能原因：室内信号弱，或系统权限处于「未决定」状态被静默忽略。\n'
+          + '建议走到窗边/室外重试一次。';
+    }
+    showTip(tip);
+    dump();
+  }, {enableHighAccuracy:false, timeout:12000, maximumAge:0});
+};
+
+function showTip(t){
+  var b = document.getElementById('tipbox');
+  b.innerHTML = '<div class="tip"></div>';
+  b.firstChild.textContent = t;
+}
+function dump(){
+  document.getElementById('raw').textContent = JSON.stringify(out, null, 2);
+}
+</script>
+</body>
+</html>

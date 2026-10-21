@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>3D 诊断 — 2D vs 3D 对比</title>
+<style>
+  body{margin:0;background:#0b1120;color:#e2e8f0;font-family:ui-monospace,Consolas,monospace;padding:12px;}
+  .row{display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap;}
+  .col{flex:1;min-width:300px;}
+  h3{font-size:13px;color:#4ade80;margin:0 0 6px;}
+  .box{border:1px solid #334155;border-radius:8px;overflow:hidden;position:relative;}
+  .box canvas,.box img{width:100%;display:block;}
+  canvas#cv3d{width:100%;height:300px;display:block;}
+  #log{font-size:11px;color:#94a3b8;white-space:pre-wrap;padding:6px;background:#1e293b;border-radius:6px;margin-top:8px;max-height:120px;overflow-y:auto;}
+  .pass{color:#4ade80;} .fail{color:#f87171;}
+</style>
+<script type="importmap">
+{"imports":{"three":"/wraps3d/lib/three.module.js","three/addons/":"/wraps3d/lib/"}}
+</script>
+</head>
+<body>
+<h3>🔬 3D 渲染诊断 — 2D 图纸 vs 3D 车模</h3>
+<div class="row">
+  <div class="col"><h3>① 2D 模板图纸</h3><div class="box"><img id="img2d" src="/wraps/modely.png"></div></div>
+  <div class="col"><h3>② 3D 车模（同贴图）</h3><div class="box"><canvas id="cv3d" width="300" height="300"></canvas></div></div>
+</div>
+<div class="row">
+  <div class="col"><h3>③ 诊断日志</h3><div id="log"></div></div>
+</div>
+<script type="module">
+import * as THREE from '/wraps3d/lib/three.module.js';
+import { GLTFLoader } from '/wraps3d/lib/loaders/GLTFLoader.js';
+import { OrbitControls } from '/wraps3d/lib/controls/OrbitControls.js';
+
+const log = document.getElementById('log');
+const L = (t, cls) => { const d = document.createElement('div'); if(cls) d.className=cls; d.textContent = '> '+t; log.appendChild(d); };
+L('页面加载完成');
+
+// ① 显示 2D 模板
+const img2d = document.getElementById('img2d');
+L('2D 模板: ' + (img2d.complete && img2d.naturalWidth > 0 ? '✅ 加载成功 ' + img2d.naturalWidth + 'x' + img2d.naturalHeight : '❌ 加载失败'), img2d.complete ? 'pass' : 'fail');
+
+// ② 3D 场景
+const cv = document.getElementById('cv3d');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1120);
+const camera = new THREE.PerspectiveCamera(40, cv.width/cv.height, 0.1, 200);
+const renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true });
+renderer.setSize(cv.width, cv.height);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+scene.add(new THREE.AmbientLight(0xffffff, 1.3));
+const dl = new THREE.DirectionalLight(0xffffff, 2.5); dl.position.set(5, 8, 6); scene.add(dl);
+
+L('WebGL 初始化: ✅', 'pass');
+
+// ③ 加载 GLB
+new GLTFLoader().load('/wraps3d/models/ModelY_High_slim.glb?v=uv2', gltf => {
+  L('GLB 模型: ✅ 加载成功', 'pass');
+  const car = gltf.scene;
+  const box = new THREE.Box3().setFromObject(car);
+  car.position.sub(box.getCenter(new THREE.Vector3()));
+  scene.add(car);
+
+  // ④ 加载官方模板贴图并应用到 Paint
+  new THREE.TextureLoader().load('/wraps/modely.png', tex => {
+    tex.flipY = true;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    let painted = 0, totalPaint = 0, noUV = 0;
+    car.traverse(o => {
+      if (!o.isMesh) return;
+      const ms = Array.isArray(o.material) ? o.material : [o.material];
+      ms.forEach(m => {
+        if (/^Paint/i.test(m.name)) {
+          totalPaint++;
+          // 检查几何体是否有 UV
+          if (o.geometry.attributes.uv) { m.map = tex; m.color.set(0xffffff); m.needsUpdate = true; painted++; }
+          else noUV++;
+        }
+      });
+    });
+    L('Paint 材质: 共 ' + totalPaint + ' | 有UV贴上 ' + painted + ' | 无UV跳过 ' + noUV, painted > 0 ? 'pass' : 'fail');
+    if (noUV > 0) L('⚠️ 有 ' + noUV + ' 个面片缺少 UV 坐标（这些区域显示为默认颜色）', 'fail');
+    L('✅ 渲染完成 — 请对比 2D 和 3D 的图案是否一致', 'pass');
+  }, undefined, e => L('贴图加载: ❌ ' + (e.message||e), 'fail'));
+}, undefined, e => L('GLB 加载: ❌ ' + (e.message||e), 'fail'));
+
+// 相机
+const controls = new OrbitControls(camera, cv);
+controls.enableDamping = true;
+camera.position.set(4, 2.5, 5);
+controls.target.set(0, 0.5, 0);
+(function loop(){ requestAnimationFrame(() => { controls.update(); renderer.render(scene, camera); loop(); }); })();
+</script>
+</body>
+</html>

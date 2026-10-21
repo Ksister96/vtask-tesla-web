@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>行驶详情 · 测试页</title>
+<style>
+body{margin:0;background:#101418;color:#dfe6ec;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;}
+.wrap{max-width:520px;margin:0 auto;padding:14px 14px 30px;}
+h1{font-size:17px;font-weight:700;margin:8px 0 12px;}
+.trip-card{background:#1a2028;border-radius:14px;padding:14px 16px;margin-bottom:12px;}
+.loc{display:flex;gap:10px;margin:6px 0;}
+.loc .bar{width:2px;background:#2a323c;margin:4px 0;border-radius:2px;position:relative;}
+.loc .bar i{position:absolute;left:-2.5px;width:7px;height:7px;border-radius:50%;}
+.loc .bar i.s{top:2px;background:#22c55e;}
+.loc .bar i.e{bottom:2px;background:#3b82f6;}
+.loc .addr{font-size:14.5px;font-weight:600;line-height:1.35;}
+.loc .tm{font-size:11.5px;color:#8a95a0;margin-top:2px;}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;background:#1a2028;border-radius:14px;padding:12px;margin-bottom:12px;}
+.cell{background:#222a33;border-radius:10px;padding:10px 6px;text-align:center;}
+.cell b{display:block;font-size:14.5px;color:#fff;}
+.cell b small{font-size:10px;color:#8a95a0;font-weight:400;margin-left:2px;}
+.cell span{display:block;font-size:10.5px;color:#8a95a0;margin-top:3px;}
+.chart-card{background:#1a2028;border-radius:14px;padding:12px 14px;}
+.chart-card h2{font-size:13.5px;margin:0 0 8px;}
+.legend{font-size:10.5px;color:#8a95a0;display:flex;gap:14px;}
+.legend i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:4px;vertical-align:middle;}
+.missing{color:#5a6570;font-size:11px;text-align:center;margin:4px 0;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>行驶详情</h1>
+  <div id="root" style="color:#8a95a0;font-size:12px;">加载中…</div>
+</div>
+<script>
+fetch('test/trip_detail_latest.json?_=' + Date.now()).then(r => r.json()).then(d => {
+  var root = document.getElementById('root');
+  if (!d || !d.distance_km) { root.textContent = '暂无行程数据'; return; }
+  var html = '';
+
+  // 起终点卡
+  html += '<div class="trip-card">'
+    + '<div class="loc"><div class="bar"><i class="s"></i></div><div>'
+    + '<div class="addr">' + (d.start_addr || '起点 (' + d.start_coord + ')') + '</div>'
+    + '<div class="tm">' + d.date + ' ' + d.start_time + '</div></div></div>'
+    + '<div class="loc"><div class="bar"><i class="e"></i></div><div>'
+    + '<div class="addr">' + (d.end_addr || '终点 (' + d.end_coord + ')') + '</div>'
+    + '<div class="tm">' + d.end_time + '</div></div></div></div>';
+
+  // 统计网格（一期数据，缺失显示 --）
+  function cell(v, unit, label) {
+    return '<div class="cell"><b>' + (v === null || v === undefined ? '--' : v) + '<small>' + (unit || '') + '</small></b><span>' + label + '</span></div>';
+  }
+  var dur = d.duration_min;
+  var durH = Math.floor(dur / 60), durM = dur % 60;
+  html += '<div class="grid">'
+    + cell(d.distance_km, 'km', '行驶里程')
+    + cell((durH ? durH + '时' : '') + durM + '分', '', '行驶用时')
+    + cell(d.avg_kmh, 'km/h', '平均车速')
+    + cell(d.max_kmh, 'km/h', '最高车速')
+    + cell(d.range_change_km !== undefined ? d.range_change_km : null, 'km', '续航变化')
+    + cell(d.range_consumed_km, 'km', '续航消耗')
+    + cell(d.range_efficiency, '%', '续航达成率')
+    + cell(d.battery_change ? (d.battery_change[0] - d.battery_change[1]).toFixed(2) : null, '%', '电量变化')
+    + cell(d.consumed_kwh, 'kWh', '消耗电量')
+    + cell(d.wh_per_km, 'Wh/km', '平均能耗')
+    + cell(d.regen_kwh, 'kWh', '动能回收')
+    + cell(d.regen_rate, '%', '动能回收率')
+    + cell(d.inside_temp_avg, '°C', '车内均温')
+    + cell(d.outside_temp_avg, '°C', '车外均温')
+    + '</div>';
+
+  // 轨迹趋势（车速）
+  html += '<div class="chart-card"><h2>轨迹趋势 <span class="legend"><span><i style="background:#4aa3ff"></i>车速 (km/h)</span><span><i style="background:#e8940a"></i>功率 (kW)</span></span></h2>'
+    + '<canvas id="spd" style="width:100%;height:150px"></canvas></div>';
+
+  root.innerHTML = html;
+
+  // 画车速曲线
+  var cv = document.getElementById('spd');
+  var W = cv.clientWidth || 400; cv.width = W * 2; cv.height = 320;
+  var x = cv.getContext('2d');
+  x.scale(2, 2);
+  var ser = (d.speed_series || []).filter(function(p){ return p[1] !== null; });
+  var pwr = (d.power_series || []).filter(function(p){ return p[1] !== null; });
+  // 绘图区：左右留双 Y 轴标注位，底部留 X 轴时间位
+  var LX = 30, RX = W - 30, TY = 10, BY = 130;
+  var t0 = null, t1 = null;
+  if (ser.length > 1) { t0 = ser[0][0]; t1 = ser[ser.length-1][0]; }
+  else if (pwr.length > 1) { t0 = pwr[0][0]; t1 = pwr[pwr.length-1][0]; }
+  if (t0 !== null) {
+    var mx = 10;
+    if (ser.length > 1) mx = Math.max.apply(null, ser.map(function(p){ return p[1] || 0; })) * 1.15;
+    mx = Math.max(mx, 10);
+    // Y 左轴（速度）：0/半程/满程 刻度 + 虚线网格
+    [[0, BY], [mx/2, (TY+BY)/2], [mx, TY]].forEach(function(g){
+      x.strokeStyle = 'rgba(255,255,255,.09)'; x.lineWidth = 1;
+      x.setLineDash([3, 4]);
+      x.beginPath(); x.moveTo(LX, g[1]); x.lineTo(RX, g[1]); x.stroke();
+      x.setLineDash([]);
+      x.fillStyle = '#8a95a0'; x.font = '9px sans-serif'; x.textAlign = 'right';
+      x.fillText(String(Math.round(g[0])), LX - 5, g[1] + 3);
+    });
+    // Y 右轴（功率）：有功率数据时标注
+    if (pwr.length > 1) {
+      var pmx = Math.max.apply(null, pwr.map(function(p){ return p[1] || 0; })) * 1.15;
+      pmx = Math.max(pmx, 5);
+      [[0, BY], [pmx/2, (TY+BY)/2], [pmx, TY]].forEach(function(g){
+        x.fillStyle = '#e8940a'; x.font = '9px sans-serif'; x.textAlign = 'left';
+        x.fillText(String(Math.round(g[0])), RX + 5, g[1] + 3);
+      });
+    }
+    // X 轴：起点/中点/终点 时间标注
+    x.fillStyle = '#8a95a0'; x.font = '9px sans-serif'; x.textAlign = 'center';
+    function tlabel(ts){ var dd = new Date(ts); return ('0'+dd.getHours()).slice(-2) + ':' + ('0'+dd.getMinutes()).slice(-2); }
+    x.fillText(tlabel(t0), LX + 16, BY + 14);
+    x.fillText(tlabel((t0+t1)/2), (LX+RX)/2, BY + 14);
+    x.fillText(tlabel(t1), RX - 16, BY + 14);
+    // 功率曲线（橙，右轴）
+    if (pwr.length > 1) {
+      x.strokeStyle = '#e8940a'; x.lineWidth = 2; x.lineJoin = 'round';
+      x.beginPath();
+      pwr.forEach(function(p, i){
+        var px = LX + (p[0] - t0) / (t1 - t0 || 1) * (RX - LX);
+        var py = BY - (p[1] || 0) / pmx * (BY - TY);
+        if (i) x.lineTo(px, py); else x.moveTo(px, py);
+      });
+      x.stroke();
+    }
+    // 车速曲线（蓝，左轴）
+    x.strokeStyle = '#4aa3ff'; x.lineWidth = 2; x.lineJoin = 'round';
+    x.beginPath();
+    ser.forEach(function(p, i){
+      var px = LX + (p[0] - t0) / (t1 - t0 || 1) * (RX - LX);
+      var py = BY - (p[1] || 0) / mx * (BY - TY);
+      if (i) x.lineTo(px, py); else x.moveTo(px, py);
+    });
+    x.stroke();
+    x.textAlign = 'left';
+  }
+}).catch(function(e){
+  document.getElementById('root').textContent = '加载失败: ' + e;
+});
+</script>
+</body>
+</html>

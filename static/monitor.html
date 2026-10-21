@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>车控监控大屏</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:14px;font-size:14px}
+.top{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+h1{font-size:19px;margin:0}
+.pill{background:#1f6feb33;color:#58a6ff;border:1px solid #1f6feb55;padding:4px 12px;border-radius:20px;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;margin-bottom:18px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px;transition:border-color .2s}
+.card.unpaired{border-color:#f8514988;background:#da363311}
+.tag-pair{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:600}
+.tag-pair.ready{background:#23863633;color:#7ee787;border:1px solid #23863666}
+.tag-pair.need{background:#da363333;color:#ffa198;border:1px solid #f8514966}
+.tag-pair.unk{background:#30363d66;color:#8b949e;border:1px solid #30363d}
+.c-uid{font-weight:700;font-size:15px;margin-bottom:2px;word-break:break-all;display:flex;align-items:center;gap:8px}
+.c-car{color:#8b949e;font-size:12px;margin-bottom:10px}
+.c-nm{display:flex;align-items:center;gap:6px;margin:2px 0 6px;font-size:13px;min-height:22px}
+.irow{font-size:14px;margin:4px 0}
+.irow .b{font-weight:600}
+.opshint{color:#8b949e;font-size:12px;border-top:1px solid #21262d;padding-top:8px;margin-top:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.evlog{background:#0d1117;border:1px solid #30363d;border-radius:12px;padding:12px 14px;max-width:900px}
+.evlog h2{font-size:14px;margin:0 0 10px;color:#58a6ff}
+.ev{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;padding:4px 7px;border-radius:6px;margin:2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ev .v{color:#7ee787;font-weight:700;margin-right:8px}
+.ev.danger{background:#da363333;border-left:3px solid #f85149;color:#ffa198}
+.ev.normal{color:#c9d1d9;background:#161b22}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+.dot.on{background:#238636;box-shadow:0 0 6px #238636}
+.dot.off{background:#f85149}
+.dot.unk{background:#8b949e}
+#foot{color:#484f58;font-size:12px;margin-top:12px}
+.empty{color:#8b949e;padding:14px}
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>🚗 车控监控大屏</h1>
+  <span class="pill" id="clock">--:--:--</span>
+</div>
+
+<div class="evlog" style="max-width:none;margin-bottom:16px">
+  <h2>👥 绑定用户</h2>
+  <div class="grid" id="grid" style="margin-bottom:0"><div class="empty">加载中…</div></div>
+</div>
+
+<div class="evlog">
+  <h2>⚡ 实时操作流（最近 80 条）</h2>
+  <div id="evs"><div class="empty">加载中…</div></div>
+</div>
+
+<div id="foot">每 3 秒自动刷新 · <span style="color:#f85149">■ 危险操作标红</span> · 口令校验：/monitor?pw=…</div>
+
+<script>
+const PW = "__PW__";
+const DANGER = ["解锁","开锁","闪灯","鸣笛","喇叭","开窗","车窗","前备箱","后备箱","wake"];
+function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+function isDanger(t){return DANGER.some(function(k){return t.indexOf(k)>=0;});}
+function iconOffline(){/* noop */}
+
+function pad(x){return String(x).padStart(2,"0");}
+function fmtTs(ts){
+  if(!ts)return "未知";
+  var d=new Date(ts*1000);
+  return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
+}
+
+function nameLabel(u){
+  return u.name?'<span style="color:#f0883e;font-weight:700">'+esc(u.name)+'</span>':'<span style="color:#8b949e">未设置</span>';
+}
+function renderName(u){
+  var v=u.name||'';
+  return '<span class="c-nm" data-uid="'+esc(u.uid)+'" data-cur="'+esc(v)+'">'
+    +'<span class="nm-show">'+nameLabel(u)+'</span>'
+    +' <button class="nm-edit" data-uid="'+esc(u.uid)+'" title="设置测试人名字" style="background:none;border:1px solid #30363d;border-radius:6px;color:#58a6ff;cursor:pointer;padding:1px 6px;font-size:12px">✏️ 设名</button>'
+    +'</span>';
+}
+function renderGrid(users){
+  var g=document.getElementById("grid");
+  if(!users || !users.length){g.innerHTML='<div class="empty">暂无已绑车用户</div>';return;}
+  g.innerHTML=users.map(function(u){
+    var on=u.online===true,off=u.online===false;
+    var dot=on?'<span class="dot on"></span>':(off?'<span class="dot off"></span>':'<span class="dot unk"></span>');
+    var bat=u.battery==null?'--':u.battery+"%";
+    var lock=u.locked==null?'--':(u.locked?'\ud83d\udd12 已锁':'\ud83d\udd13 未锁');
+    var chg=u.charging==null?'':(' | \u26a1 '+esc(u.charging));
+    var pTag = '';
+    var cardCls = 'card';
+    if(u.pair_ready === true){
+      pTag = '<span class="tag-pair ready" title="探测时间: '+esc(u.pair_ts||'--')+'">🔑 钥匙已绑</span>';
+    } else if(u.pair_ready === false){
+      pTag = '<span class="tag-pair need" title="探测时间: '+esc(u.pair_ts||'--')+'">⚠️ 钥匙未绑</span>';
+      cardCls += ' unpaired';
+    } else {
+      pTag = '<span class="tag-pair unk">❔ 钥匙未知</span>';
+    }
+    return '<div class="'+cardCls+'" data-uid="'+esc(u.uid)+'">'
+      +'<div class="c-uid">'+dot+'<span>'+esc(u.uid)+'</span></div>'
+      +'<div class="c-nm">'+renderName(u)+'</div>'
+      +'<div class="c-car">\ud83d\ude99 '+esc(u.car)+(u.vin?' \u00b7 '+esc(u.vin):'')+'</div>'
+      +'<div class="irow">\ud83d\udd0b <span class="b">'+bat+'</span></div>'
+      +'<div class="irow">'+lock+chg+'</div>'
+      +'<div class="irow" style="margin-top:6px">'+pTag+'</div>'
+      +'<div class="opshint" title="'+esc(u.last_op||'')+'">最后操作：'+esc(u.last_op||'（无）')+'</div>'
+      +'</div>';
+  }).join("");
+}
+function whoLine(u){
+  if(u.user_name){return '<span style="color:#f0883e;font-weight:700">'+esc(u.user_name)+'</span> <span style="color:#6e7681;font-size:11px">('+esc(u.uid)+')</span>';}
+  return '<span>'+esc(u.uid)+'</span>';
+}
+function renderEvents(evs){
+  var el=document.getElementById("evs");
+  if(!evs || !evs.length){el.innerHTML='<div class="empty">暂无操作记录</div>';return;}
+  el.innerHTML=evs.map(function(e){
+    var dng=isDanger(e.line);
+    var cls=dng?'ev danger':'ev normal';
+    return '<div class="'+cls+'"><span class="v">'+whoLine(e)+'</span>'+esc(e.line)+(dng?' \u26a0\ufe0f':'')+'</div>';
+  }).join("");
+}
+function saveName(uid,name){
+  var body=JSON.stringify({uid:uid,name:name,pw:PW});
+  fetch("/api/monitor/set_name?pw="+encodeURIComponent(PW),{method:"POST",headers:{"Content-Type":"application/json"},body:body})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(!d||!d.ok){alert("保存失败");}
+      loadAll();
+    })
+    .catch(function(){alert("保存失败");});
+}
+function openEdit(uid){
+  var p=document.querySelector('.c-nm[data-uid="'+uid+'"]');
+  if(!p)return;
+  var cur=p.getAttribute("data-cur")||"";
+  p.innerHTML='<input type="text" value="'+esc(cur)+'" placeholder="测试人名字" class="nm-input" style="background:#0d1117;color:#fff;border:1px solid #30363d;border-radius:6px;padding:4px 8px;font-size:13px;width:150px" onkeydown="if(event.key===\'Enter\'){var v=this.value;saveName(\''+uid+'\',v);} if(event.key===\'Escape\'){loadAll();}"/>'
+    +' <button onclick="var inp=this.previousElementSibling;saveName(\''+uid+'\',inp.value);" style="background:#238636;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:13px">保存</button>';
+  var inp=p.querySelector('input'); inp.focus(); inp.select();
+}
+function loadAll(){
+  // 增量渲染：正在改名（nm-input 聚焦）时本轮跳过，避免 3s 全量重绘打断输入；
+  // 数据未变化时跳过 DOM 写入，避免无谓重绘。
+  var ae=document.activeElement;
+  if(ae && ae.classList && ae.classList.contains("nm-input")) return;
+  fetch("/api/monitor/overview?pw="+encodeURIComponent(PW)).then(function(r){return r.json();})
+    .then(function(d){
+      if(!(d&&d.ok)) return;
+      var sig=JSON.stringify(d.users||[]);
+      if(sig!==lastGridSig){ lastGridSig=sig; renderGrid(d.users); }
+    })
+    .catch(function(){});
+  fetch("/api/monitor/events?pw="+encodeURIComponent(PW)).then(function(r){return r.json();})
+    .then(function(d){
+      if(!(d&&d.ok)) return;
+      var sig=JSON.stringify(d.events||[]);
+      if(sig!==lastEvsSig){ lastEvsSig=sig; renderEvents(d.events); }
+    })
+    .catch(function(){});
+}
+var lastGridSig=null,lastEvsSig=null;
+document.addEventListener("click",function(ev){
+  var t=ev.target;
+  if(t && t.classList && t.classList.contains("nm-edit")){openEdit(t.getAttribute("data-uid"));}
+});
+
+function tick(){
+  var d=new Date();
+  document.getElementById("clock").textContent=d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
+}
+
+loadAll();
+tick();
+setInterval(loadAll,3000);
+setInterval(tick,1000);
+</script>
+</body>
+</html>

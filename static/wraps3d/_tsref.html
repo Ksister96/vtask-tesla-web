@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>tesla-skin 参照（本地引擎）</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  iframe{width:100%;height:100%;border:none}
+  #tip{position:fixed;top:6px;left:8px;color:#8f8;font:12px monospace;z-index:9;background:rgba(0,0,0,.6)}
+</style>
+</head>
+<body>
+<div id="tip">waiting godot_ready...</div>
+<iframe id="f" src="/wraps3d/_ts/index.html" allow="cross-origin-isolated"></iframe>
+<script>
+  const QS = new URLSearchParams(location.search);
+  const MODEL = QS.get('car') || 'modely-2025-base';
+  const tip = document.getElementById('tip');
+  let sent = false;
+  window.addEventListener('message', function (e) {
+    const d = e.data;
+    if (!d || typeof d !== 'object') return;
+    if (d.type === 'godot_ready' && !sent) {
+      sent = true;
+      tip.textContent = 'ready -> ' + MODEL;
+      setTimeout(function () {
+        document.getElementById('f').contentWindow.postMessage(
+          { type: 'load_scene', data: { modelId: MODEL } }, '*');
+        tip.textContent = 'load_scene: ' + MODEL;
+        setTimeout(function () {
+          document.getElementById('f').contentWindow.postMessage(
+            { type: 'set_camera_preset', data: { preset: 'three_quarter' } }, '*');
+        }, 5000);
+      }, 1200);
+    } else if (d.type === 'car_loaded') {
+      tip.textContent = 'LOADED: ' + (d.data && d.data.modelId);
+    } else if (d.type === 'godot_loading_progress') {
+      tip.textContent = 'loading ' + (d.data && d.data.progress) + '%';
+    } else if (d.type === 'error') {
+      tip.textContent = 'ERROR: ' + (d.data && d.data.message);
+    }
+  });
+</script>
+</body>
+</html>

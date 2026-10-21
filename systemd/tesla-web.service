@@ -1,0 +1,19 @@
+[Unit]
+Description=Tesla Fleet Multi-User Web (port 8794)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 凭据统一放 /etc/tesla.env（TESLA_CLIENT_ID / TESLA_CLIENT_SECRET / MP_WX_APPID /
+# MP_WX_SECRET / OWNER_BASE / MULTI_BASE / AMAP_KEY），权限 600，永不入库
+Type=simple
+WorkingDirectory=/opt/tesla-fleet-multi
+EnvironmentFile=/etc/tesla.env
+ExecStart=/usr/bin/python3.11 -X utf8 car-web-multi.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/tesla-fleet-multi/multi-web.log
+StandardError=append:/opt/tesla-fleet-multi/multi-web.err.log
+
+[Install]
+WantedBy=multi-user.target

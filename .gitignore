@@ -1,0 +1,35 @@
+# 运行时数据（凭据/用户数据/日志）永不入库
+users/
+*.sqlite3
+*.sqlite3-journal
+amap_key.txt
+tokens*.json
+friends-codes.json
+oauth-pending.json
+sessions.json
+announcement.json
+monitor.json
+wrap_gallery_cache.json
+gallery_thumb_paths.json
+identity.sqlite3*
+
+# 日志与大文件
+*.log
+*.webm
+*.pck
+*.wasm
+static/wraps3d/models/*.glb
+static/wraps3d/_ts/
+static/wraps3d/_wheel*/
+static/wraps3d/_vtest/
+static/*.bak*
+
+# Python
+__pycache__/
+*.pyc
+*.patched
+
+# 本机/临时
+_srv/
+_*_idmap_*.png
+tmp_*

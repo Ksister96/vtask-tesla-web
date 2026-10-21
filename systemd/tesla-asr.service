@@ -1,0 +1,21 @@
+[Unit]
+Description=Tesla Fleet ASR (sherpa-onnx SenseVoice int8, port 8790)
+Documentation=https://github.com/k2-fsa/sherpa-onnx
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tesla-asr
+# asr_server.py: POST /transcribe {path} -> {text}，配合 asr_postprocess.py 做车控语境纠正
+ExecStart=/opt/tesla-asr/venv/bin/python -u /opt/tesla-asr/asr_server.py
+Restart=always
+RestartSec=5
+Environment=PYTHONIOENCODING=utf-8
+# ASR 允许被内存压力优先干掉（web 是主服务）
+OOMScoreAdjust=500
+MemoryMax=900M
+StandardOutput=append:/opt/tesla-asr/asr.log
+StandardError=append:/opt/tesla-asr/asr.log
+
+[Install]
+WantedBy=multi-user.target

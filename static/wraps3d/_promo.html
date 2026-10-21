@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Promo Capture v2 (sandbox only)</title>
+<script type="importmap">
+{"imports":{"three":"/wraps3d/lib/three.module.js?v=uv2","three/addons/":"/wraps3d/lib/"}}
+</script>
+<style>
+  html,body{margin:0;background:#000;overflow:hidden}
+  #c{width:1080px;height:1080px;display:block}
+  #hud{position:fixed;left:8px;top:8px;color:#9aa;font-size:12px;white-space:pre-line;z-index:9}
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1080"></canvas>
+<div id="hud">loading…</div>
+<script>
+window.addEventListener('error', function(e){
+  document.getElementById('hud').textContent = 'LOAD-ERR: ' + (e.message || e.filename || 'unknown');
+});
+window.addEventListener('unhandledrejection', function(e){
+  document.getElementById('hud').textContent = 'REJ: ' + (e.reason && e.reason.message || e.reason);
+});
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const hud = document.getElementById('hud');
+const canvas = document.getElementById('c');
+const SZ = 1080;
+const Q = new URLSearchParams(location.search);
+
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true, preserveDrawingBuffer:true, alpha:true});
+renderer.setPixelRatio(1);
+renderer.setSize(SZ, SZ, false);
+renderer.setClearColor(0x000000, 0);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+scene.background = null;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x2a2f3c, 1.0));
+const hemi = scene.children[scene.children.length - 1];
+const dir = new THREE.DirectionalLight(0xffffff, 1.9);
+dir.position.set(5, 8, 4);
+scene.add(dir);
+const dir2 = new THREE.DirectionalLight(0xdfe8ff, 0.7);
+dir2.position.set(-6, 4, -5);
+scene.add(dir2);
+/* rim light: 低角度冷光勾边，车肩线更立体 */
+const rim = new THREE.DirectionalLight(0xbfd4ff, 1.1);
+rim.position.set(0, 2.2, -8);
+scene.add(rim);
+
+/* 影棚环境：暗底 + 高亮灯带 → 车漆上出现干净的高光条 */
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envScene = new THREE.Scene();
+envScene.background = new THREE.Color(0x05070c);
+const _strip = (w, h, c, x, y, z, rx, ry) => {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({color: c, side: THREE.DoubleSide}));
+  m.position.set(x, y, z); m.rotation.set(rx, ry, 0); envScene.add(m);
+};
+_strip(7, 2.2, 0xffffff, 0, 3.2, 0, Math.PI / 2, 0);
+_strip(9, 1.6, 0xf4f8ff, 0, 1.6, -5.5, 0, 0);
+_strip(9, 1.2, 0x232833, 0, 1.0, 5.5, 0, Math.PI);
+_strip(2, 1.6, 0xffffff, -4.5, 1.8, 0, 0, Math.PI / 2);
+_strip(2, 1.6, 0xffffff, 4.5, 1.8, 0, 0, -Math.PI / 2);
+scene.environment = pmrem.fromScene(envScene, 0.03).texture;
+
+const camera = new THREE.PerspectiveCamera(40, 1, 0.05, 100);
+const TARGET = new THREE.Vector3(0, 0.75, 0);
+
+/* ==== materials (与 uvcars.html 一致) ==== */
+const wrapMat = new THREE.MeshStandardMaterial({color: 0xffffff, roughness: 0.38, metalness: 0.05, side: THREE.DoubleSide});
+const extShellMat = new THREE.MeshStandardMaterial({color: 0x0a0a0c, roughness: 0.45, metalness: 0.15, side: THREE.DoubleSide});
+const roughPaintMat = new THREE.MeshStandardMaterial({color: 0x0a0a0c, roughness: 0.62, metalness: 0.0, side: THREE.DoubleSide});
+const glassMat = new THREE.MeshStandardMaterial({color: 0x080b10, transparent: true, opacity: 0.78,
+  roughness: 0.05, metalness: 0.25, side: THREE.DoubleSide});
+glassMat.envMapIntensity = 0;
+const lensMat = new THREE.MeshStandardMaterial({color: 0xc9d2d9, roughness: 0.3, metalness: 0.15,
+  transparent: true, opacity: 0.92, side: THREE.DoubleSide});
+lensMat.envMapIntensity = 0.15;
+const lampMat = new THREE.MeshStandardMaterial({color: 0x3a4046, roughness: 0.25, metalness: 0.3});
+const interiorMat = new THREE.MeshStandardMaterial({color: 0x232529, roughness: 0.85, side: THREE.DoubleSide});
+const tireMat = new THREE.MeshStandardMaterial({color: 0x0a0a0b, roughness: 0.92, side: THREE.DoubleSide});
+const rimMat = new THREE.MeshStandardMaterial({color: 0x363a41, roughness: 0.42, metalness: 0.6, side: THREE.DoubleSide});
+const rotorMat = new THREE.MeshStandardMaterial({color: 0x8f9398, roughness: 0.45, metalness: 0.8, side: THREE.DoubleSide});
+const caliperMat = new THREE.MeshStandardMaterial({color: 0xd8dbde, roughness: 0.4, metalness: 0.3, side: THREE.DoubleSide});
+const plateMat = new THREE.MeshStandardMaterial({color: 0xd8dadb, roughness: 0.5, side: THREE.DoubleSide});
+const underMat = new THREE.MeshStandardMaterial({color: 0x131418, roughness: 0.9, side: THREE.DoubleSide});
+const cladMat = new THREE.MeshStandardMaterial({color: 0x000919, roughness: 0.55, side: THREE.DoubleSide});
+const tailLampMat = new THREE.MeshStandardMaterial({color: 0x2a0e0a, roughness: 0.28, metalness: 0.15, side: THREE.DoubleSide});
+const cvrBMat = new THREE.MeshStandardMaterial({color: 0x060606, roughness: 0.3, side: THREE.DoubleSide});
+
+function matClass(mn){
+  if (mn === 'Paint' || mn === 'PaintFade' || mn === 'Paint2') return 'wrap';
+  if (mn === 'Exterior' || mn === 'ExteriorFade' || mn === 'Exterior_Perf') return 'ext';
+  if (mn === 'PaintRough' || mn === 'Paint_Rough_Perf') return 'rough';
+  if (mn === 'TireDark') return 'tire';
+  if (mn === 'RimSilver') return 'rim';
+  if (mn === 'RotorSteel') return 'rotor';
+  if (mn === 'CaliperPaint') return 'caliper';
+  if (mn === 'UnderbodyDark') return 'under';
+  if (/^Glass|MirrorFade/.test(mn)) return 'glass';
+  if (mn === 'standardSurface2' || mn === 'aistandardsuface') return 'lens';
+  if (mn === 'Light_Off') return 'lamp';
+  if (/^(Light|Light_Global|LightsFade|Illumination|Fog_Cover|Chargeport|Grille|Reflector|GlossyBlack|DRL_)/.test(mn)) return 'lamp';
+  if (/Projection$/.test(mn) || mn === 'Ground_Plane' || mn === 'GroundPlane' || mn === 'Beam') return 'hide';
+  if (mn === 'Plates') return 'plate';
+  if (mn === 'Spoiler' || mn === 'Cover' || mn === 'Cover_Fade') return 'paint';
+  return 'interior';
+}
+const MATS = {wrap: wrapMat, ext: extShellMat, rough: roughPaintMat, glass: glassMat,
+  lamp: lampMat, lens: lensMat, interior: interiorMat, tire: tireMat, rim: rimMat, rotor: rotorMat,
+  caliper: caliperMat, plate: plateMat, under: underMat, clad: cladMat, cvrB: cvrBMat,
+  tailLamp: tailLampMat, paint: extShellMat, hide: null};
+
+const CFG = {
+  glb: '/wraps3d/models/Bayberry2_cars_slim.glb?v=bbs1',
+  defaultTex: '/wraps3d/models/modely_2025_performance.png',
+  hideMeshes: ['Fascia_Perf', 'Spoiler_Perf', 'Seats_Perf', 'DRL', 'Headlights_On',
+    'Fog_Light_On', 'Parking_Lights_On', 'Brake_Lights_On', 'Left_Turn_Signal_On',
+    'Right_Turn_Signal_On', 'Back_Left_Turn_Signal_On', 'Back_Right_Turn_Signal_On',
+    'Parking_Light_Projection', 'Headlights_Beam', 'LeftGlow', 'RightGlow', 'HorizontalGlow',
+    'Tesla_Badge', 'Plate_US', 'Plate_EU', 'RHD', 'Doorcard_LF_RHD', 'Doorcard_RF_RHD',
+    'Skullcap_LF_SierraBlack', 'Skullcap_RF_SierraBlack', 'Defrost_Front', 'Defrost_Rear',
+    'BrakeLightProjection', 'HeadLightProjection', 'Reverse Light On'],
+  official: ['BrakeLightProjection', 'HeadLightProjection', 'Tesla_Badge', 'Plate_US', 'Plate_EU',
+    'DRL', 'Headlights_On', 'Fog_Light_On', 'Parking_Lights_On', 'Parking_Light_Projection',
+    'Brake_Lights_On', 'Left_Turn_Signal_On', 'Right_Turn_Signal_On',
+    'Back_Left_Turn_Signal_On', 'Back_Right_Turn_Signal_On',
+    'LeftGlow', 'RightGlow', 'HorizontalGlow', 'Headlights_Beam',
+    'RHD', 'Doorcard_LF_RHD', 'Doorcard_RF_RHD',
+    'Skullcap_LF_SierraBlack', 'Skullcap_RF_SierraBlack',
+    'Defrost_Front', 'Defrost_Rear', 'Spoiler_Perf', 'Fascia_Perf', 'Seats_Perf'],
+};
+const HIDE_MESH = new Set(['Floor', 'Headlights_Projections', 'Taillights_Projection', 'Stoplights_Projection']);
+
+const composeCv = document.createElement('canvas');
+composeCv.width = 1024; composeCv.height = 1024;
+const composeCx = composeCv.getContext('2d');
+let paintHex = '#f8fafc';
+let templateImg = null;
+let liveTex = null;
+let wrapTargets = [];
+
+function paintNeutralDisks(){}
+function composeDesign(imgEl){
+  composeCx.fillStyle = paintHex;
+  composeCx.fillRect(0, 0, 1024, 1024);
+  composeCx.drawImage(imgEl, 0, 0, 1024, 1024);
+  paintNeutralDisks();
+}
+function applyLive(){
+  if (!liveTex){
+    liveTex = new THREE.CanvasTexture(composeCv);
+    liveTex.flipY = false;
+    liveTex.colorSpace = THREE.SRGBColorSpace;
+    liveTex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  }
+  liveTex.channel = 1;
+  liveTex.needsUpdate = true;
+  for (const o of wrapTargets){
+    o.material.map = liveTex; o.material.color.set(0xffffff);
+    o.material.roughness = 0.38; o.material.metalness = 0.05; o.material.needsUpdate = true;
+  }
+}
+function loadImg(src){
+  const finalSrc = src.startsWith("data:") ? src : src + (src.includes("?") ? "&" : "?") + "v=" + Date.now();
+  return new Promise((resolve, reject) => {
+    const im = new Image();
+    im.onload = () => resolve(im);
+    im.onerror = (e) => reject(new Error("img fail " + src.slice(0, 60)));
+    im.src = finalSrc;
+  });
+}
+
+async function setPaint(hexOrObj){
+  if (typeof hexOrObj === 'object' && hexOrObj.wrap){
+    const img = await loadImg(hexOrObj.wrap);
+    composeCx.fillStyle = '#f8fafc';
+    composeCx.fillRect(0, 0, 1024, 1024);
+    composeCx.drawImage(img, 0, 0, 1024, 1024);
+    applyLive();
+    return 'wrap';
+  }
+  let fillStyle = '#f8fafc';
+  if (typeof hexOrObj === 'object' && hexOrObj.g){
+    paintHex = 'gradient:' + hexOrObj.g.join('-');
+    const [c1, c2] = hexOrObj.g;
+    const deg = ((hexOrObj.deg === undefined ? 135 : hexOrObj.deg) * Math.PI) / 180;
+    const x2 = Math.cos(deg) * 1024, y2 = Math.sin(deg) * 1024;
+    const gr = composeCx.createLinearGradient(0, 0, x2, y2);
+    gr.addColorStop(0, c1); gr.addColorStop(1, c2);
+    fillStyle = gr;
+  } else {
+    paintHex = (typeof hexOrObj === 'string' ? hexOrObj : '#f8fafc');
+    fillStyle = paintHex;
+  }
+  if (!templateImg) templateImg = await loadImg(CFG.defaultTex);
+  composeCx.fillStyle = fillStyle;
+  composeCx.fillRect(0, 0, 1024, 1024);
+  composeCx.globalCompositeOperation = 'multiply';
+  composeCx.drawImage(templateImg, 0, 0, 1024, 1024);
+  composeCx.globalCompositeOperation = 'source-over';
+  paintNeutralDisks();
+  applyLive();
+  return paintHex;
+}
+
+new GLTFLoader().load(CFG.glb, (gltf) => {
+  const model = gltf.scene;
+  model.scale.setScalar(0.95);
+  window.__model = model;
+  const assoc = gltf.parser.associations;
+  const jmeshes = gltf.parser.json.meshes;
+  const jnames = jmeshes.map(m => (m && m.name) || '');
+  const globalHide = new Set(jnames.filter(nm => nm.endsWith('_GLOBAL') && jnames.includes(nm.slice(0, -7))));
+  const counters = {};
+  model.traverse(o => {
+    if (!o.isMesh) return;
+    if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+    const a = assoc.get(o) || {};
+    const mi = a.meshes;
+    if (mi === undefined) return;
+    const base = jnames[mi] || ('mesh' + mi);
+    const pidx = a.primitives || 0;
+    const gmat = jmeshes[mi].primitives[pidx] && jmeshes[mi].primitives[pidx].material;
+    const matName = (gmat !== undefined && gltf.parser.json.materials[gmat]) ? gltf.parser.json.materials[gmat].name || '?' : '?';
+    if ((HIDE_MESH.has(base) || globalHide.has(base) || (CFG.hideMeshes || []).includes(base))){
+      o.visible = false; return;
+    }
+    var cls = null;
+    if (CFG.official){
+      if (CFG.official.includes(base)){ o.visible = false; counters.officialHide = (counters.officialHide || 0) + 1; return; }
+      cls = matClass(matName);
+      if (cls === 'hide'){ o.visible = false; return; }
+      if (cls === 'wrap'){ wrapTargets.push(o); counters.wrap = (counters.wrap || 0) + 1; return; }
+      if (cls === 'glass' || cls === 'tire' || cls === 'rim'){ o.material = MATS[cls]; return; }
+      return;
+    }
+    cls = matClass(matName);
+    counters[cls] = (counters[cls] || 0) + 1;
+    if (cls === 'hide'){ o.visible = false; return; }
+    o.material = MATS[cls] || interiorMat;
+    if (cls === 'wrap') wrapTargets.push(o);
+  });
+  scene.add(model);
+  window.__promoReady = { counters, wrapTargets: wrapTargets.length };
+  hud.textContent = 'ready wrap=' + wrapTargets.length;
+  if (window.__promoWaitReady){ const f = window.__promoWaitReady; window.__promoWaitReady = null; f(); }
+}, (ev) => {
+  if (ev.total) hud.textContent = 'loading ' + Math.round(ev.loaded / ev.total * 100) + '%';
+  else hud.textContent = 'loading…';
+}, (e) => {
+  hud.textContent = 'GLB-ERR: ' + (e && e.message || 'unknown');
+});
+
+function setCam(cfg){
+  const az = (cfg.az * Math.PI) / 180;
+  const pol = (cfg.pol * Math.PI) / 180;
+  const sph = new THREE.Spherical(cfg.r === undefined ? 7.0 : cfg.r, pol, az);
+  camera.position.setFromSpherical(sph);
+  const t = cfg.t || [0, 0.75, 0];
+  TARGET.set(t[0], t[1], t[2]);
+  camera.position.add(TARGET);
+  camera.lookAt(TARGET);
+}
+function grab(png){
+  return canvas.toDataURL(png ? 'image/png' : 'image/jpeg', png ? undefined : 0.95);
+}
+
+window.__promo = {
+  async ready(){
+    if (window.__promoReady) return window.__promoReady;
+    return await new Promise((res) => { window.__promoWaitReady = () => res(window.__promoReady); });
+  },
+  setPaint,
+  async snapBatch(list){
+    const out = [];
+    for (const it of list){
+      if (it.paint !== undefined || it.wrap){ await setPaint(it.paint !== undefined ? it.paint : it); }
+      setCam(it);
+      renderer.render(scene, camera);
+      out.push(grab(it.png));
+    }
+    return out;
+  },
+  snapOnce(it){
+    setCam(it);
+    renderer.render(scene, camera);
+    return grab(it.png);
+  },
+  status(){
+    return { ready: !!window.__promoReady, info: window.__promoReady || null };
+  },
+};
+</script>
+</body>
+</html>

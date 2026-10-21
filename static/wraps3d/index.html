@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, user-scalable=no">
+	<title>Autopilot Visualizer</title>
+	<style type="text/css">
+		body {
+			touch-action: none;
+			margin: 0;
+			border: 0 none;
+			padding: 0;
+			text-align: center;
+			background-color: #1a1a1c;
+			overflow: hidden;
+		}
+
+		#canvas {
+			display: block;
+			margin: 0;
+			color: white;
+		}
+
+		#canvas:focus {
+			outline: none;
+		}
+
+		/* Status/loading elements - hidden for React integration */
+		#status, #status-progress, #status-progress-inner, 
+		#status-indeterminate, #status-notice {
+			display: none !important;
+		}
+	</style>
+	
+	<!-- ================================================================
+	     GODOT BRIDGE - React <-> Godot Communication Layer
+	     This MUST be loaded before the Godot engine initializes
+	     ================================================================ -->
+	<script type="text/javascript">
+	(function() {
+		'use strict';
+
+		// Message queue for React -> Godot communication
+		const messageQueue = [];
+
+		// Event listeners for Godot -> React communication
+		const eventListeners = {};
+
+		// State tracking
+		let godotReady = false;
+		let carLoaded = false;
+		let currentModelId = null;
+
+		function init() {
+			console.log('[GodotBridge] Initializing...');
+
+			// Create the global godot object
+			window.godot = {
+				// Send a message to Godot
+				sendMessage: function(message) {
+					if (!message || typeof message !== 'object') {
+						console.error('[GodotBridge] Invalid message:', message);
+						return false;
+					}
+					if (!message.type) {
+						console.error('[GodotBridge] Message missing type:', message);
+						return false;
+					}
+					console.log('[GodotBridge] Queueing message:', message.type);
+					messageQueue.push(JSON.stringify(message));
+					return true;
+				},
+
+				loadScene: function(modelId) {
+					return this.sendMessage({ type: 'load_scene', modelId: modelId });
+				},
+
+				setTexture: function(dataUrl) {
+					return this.sendMessage({ type: 'set_texture', texture: dataUrl });
+				},
+
+				setCarState: function(state) {
+					return this.sendMessage({ type: 'set_car_state', state: state });
+				},
+
+				setPaint: function(colorName) {
+					return this.sendMessage({ type: 'set_paint', color: colorName });
+				},
+
+				setSkin: function(skinName) {
+					return this.sendMessage({ type: 'set_skin', skin: skinName });
+				},
+
+				setCameraAngle: function(horizontal, vertical, distance) {
+					return this.sendMessage({
+						type: 'set_camera_angle',
+						horizontal: horizontal,
+						vertical: vertical,
+						distance: distance || -1
+					});
+				},
+
+				setCameraPreset: function(preset) {
+					return this.sendMessage({ type: 'set_camera_preset', preset: preset });
+				},
+
+				setAutoRotate: function(enabled) {
+					return this.sendMessage({ type: 'set_camera_auto_rotate', enabled: enabled });
+				},
+
+			resetCamera: function() {
+				return this.sendMessage({ type: 'reset_camera' });
+			},
+
+			setPlateRegion: function(region) {
+				return this.sendMessage({ type: 'set_plate_region', region: region });
+			},
+
+				// Called by Godot to get next pending message
+				getPendingMessage: function() {
+					if (messageQueue.length === 0) return null;
+					return messageQueue.shift();
+				},
+
+				getPendingMessageCount: function() {
+					return messageQueue.length;
+				},
+
+				// Called by Godot to send events back to React
+				onGodotMessage: function(event) {
+					if (!event || !event.type) {
+						console.warn('[GodotBridge] Invalid event from Godot:', event);
+						return;
+					}
+					console.log('[GodotBridge] Received from Godot:', event.type, event.data);
+
+					switch (event.type) {
+						case 'godot_ready': godotReady = true; break;
+						case 'car_loaded': 
+							carLoaded = true;
+							currentModelId = event.data?.modelId;
+							break;
+						case 'error':
+							console.error('[GodotBridge] Godot error:', event.data?.message);
+							break;
+					}
+
+					// Notify listeners
+					(eventListeners[event.type] || []).forEach(cb => { try { cb(event.data); } catch(e) {} });
+					(eventListeners['*'] || []).forEach(cb => { try { cb(event); } catch(e) {} });
+
+					// Post to parent window (for iframe)
+					if (window.parent && window.parent !== window) {
+						try { window.parent.postMessage(event, '*'); } catch(e) {}
+					}
+				},
+
+				on: function(eventType, callback) {
+					if (!eventListeners[eventType]) eventListeners[eventType] = [];
+					eventListeners[eventType].push(callback);
+					return function() {
+						const idx = eventListeners[eventType].indexOf(callback);
+						if (idx !== -1) eventListeners[eventType].splice(idx, 1);
+					};
+				},
+
+				off: function(eventType, callback) {
+					const listeners = eventListeners[eventType];
+					if (!listeners) return;
+					const idx = listeners.indexOf(callback);
+					if (idx !== -1) listeners.splice(idx, 1);
+				},
+
+				isReady: function() { return godotReady; },
+				isCarLoaded: function() { return carLoaded; },
+				getCurrentModelId: function() { return currentModelId; },
+				clearQueue: function() { messageQueue.length = 0; },
+				reset: function() {
+					messageQueue.length = 0;
+					godotReady = false;
+					carLoaded = false;
+					currentModelId = null;
+				}
+			};
+
+		// Listen for postMessage from parent (React app)
+		window.addEventListener('message', function(event) {
+			if (event.data && event.data.type) {
+				console.log('[GodotBridge] Received postMessage:', event.data.type);
+				
+				// Handle resize request from parent (function defined later in body script)
+				if (event.data.type === 'resize' || event.data.type === 'force_resize') {
+					if (typeof window.adjustCanvasDimensions === 'function') {
+						window.adjustCanvasDimensions();
+					}
+					return;
+				}
+				
+				window.godot.sendMessage(event.data);
+			}
+		});
+
+			// Godot-compatible aliases (SceneManager.gd uses these)
+			window.godot_sendMessage = function(jsonStr) {
+				try {
+					const event = typeof jsonStr === 'string' ? JSON.parse(jsonStr) : jsonStr;
+					window.godot.onGodotMessage(event);
+					return true;
+				} catch(e) {
+					console.error('[GodotBridge] godot_sendMessage error:', e);
+					return false;
+				}
+			};
+
+			window.godot_pendingMessagesCount = function() {
+				return messageQueue.length;
+			};
+
+			window.godot_getPendingMessage = function() {
+				if (messageQueue.length === 0) return '';
+				return messageQueue.shift();
+			};
+
+		console.log('[GodotBridge] Ready. Use window.godot to communicate with Godot.');
+	}
+
+	// Initialize immediately
+	init();
+})();
+	</script>
+	
+	<!-- Load Godot Engine (defines the Engine class) -->
+	<script type="text/javascript" src="index.js"></script>
+	
+</head>
+<body>
+	<canvas id="canvas">
+		HTML5 canvas appears to be unsupported in the current browser.<br />
+		Please try updating or use a different browser.
+	</canvas>
+
+	<div id="status" style="display: none;">
+		<div id="status-progress" style="display: none;">
+			<div id="status-progress-inner"></div>
+		</div>
+		<div id="status-indeterminate" style="display: none;">
+			<div></div><div></div><div></div><div></div>
+			<div></div><div></div><div></div><div></div>
+		</div>
+		<div id="status-notice" style="display: none;"></div>
+	</div>
+
+	<script type="text/javascript">//<![CDATA[
+		var engine = new Engine;
+		var setStatusMode;
+		var setStatusNotice;
+
+		// IndexedDB caching for .pck files
+		// Pack version - increment this when pack is updated to invalidate cache
+		const PACK_VERSION = '1.0.0';
+		
+		(function() {
+			const DB_NAME = 'tesla-wrap-godot-cache';
+			const DB_VERSION = 1;
+			const STORE_NAME = 'pck-files';
+
+			function openDB() {
+				/* 微特补丁：iOS 下 indexedDB.open 可能永久挂起（挂起=缓存检查永不结束、下载不启动）——4秒超时强制直连下载 */
+				return new Promise(function(resolve, reject) {
+					var settled = false;
+					var to = setTimeout(function() {
+						if (!settled) { settled = true; reject(new Error('idb timeout')); }
+					}, 4000);
+					var request = indexedDB.open(DB_NAME, DB_VERSION);
+					request.onerror = function() { if (!settled) { settled = true; clearTimeout(to); reject(request.error); } };
+					request.onsuccess = function() { if (!settled) { settled = true; clearTimeout(to); resolve(request.result); } };
+					request.onupgradeneeded = function(event) {
+						var db = event.target.result;
+						if (!db.objectStoreNames.contains(STORE_NAME)) {
+							var store = db.createObjectStore(STORE_NAME, { keyPath: 'url' });
+							store.createIndex('cachedAt', 'cachedAt', { unique: false });
+							store.createIndex('version', 'version', { unique: false });
+						}
+					};
+				});
+			}
+
+			window.godotCache = {
+				getCachedPack: function(url, version) {
+					try {
+					return openDB().then(function(db) {
+						return new Promise(function(resolve) {
+							var transaction = db.transaction([STORE_NAME], 'readonly');
+							var store = transaction.objectStore(STORE_NAME);
+							var request = store.get(url);
+							request.onsuccess = function() {
+								var cached = request.result;
+								if (cached && cached.version === version) {
+									console.log('[GodotCache] Cache hit for ' + url);
+									resolve(cached.data);
+								} else {
+									if (cached && cached.version !== version) {
+										console.log('[GodotCache] Cache miss - version mismatch (cached: ' + cached.version + ', required: ' + version + ')');
+									} else {
+										console.log('[GodotCache] Cache miss for ' + url);
+									}
+									resolve(null);
+								}
+							};
+							request.onerror = function() { resolve(null); };
+						});
+					}).catch(function() { return null; });
+					} catch (e) { console.log("[GodotCache] openDB sync error: " + e); return Promise.resolve(null); }
+				},
+
+				cachePack: function(url, version, data) {
+					return openDB().then(function(db) {
+						return new Promise(function(resolve, reject) {
+							var transaction = db.transaction([STORE_NAME], 'readwrite');
+							var store = transaction.objectStore(STORE_NAME);
+							var cached = {
+								url: url,
+								version: version,
+								data: data,
+								cachedAt: Date.now(),
+								size: data.size
+							};
+							var request = store.put(cached);
+							request.onsuccess = function() {
+								console.log('[GodotCache] Cached ' + url + ' (' + (data.size / 1024 / 1024).toFixed(2) + 'MB)');
+								resolve();
+							};
+							request.onerror = function() { reject(request.error); };
+						});
+					}).catch(function(err) {
+						console.warn('[GodotCache] Failed to cache:', err);
+					});
+				},
+
+				downloadPack: function(url, version) {
+					var self = this;
+					return this.getCachedPack(url, version).then(function(cached) {
+						if (cached) {
+							return cached;
+						}
+						console.log('[GodotCache] Downloading ' + url + '...');
+						return fetch(url).then(function(response) {
+							if (!response.ok) {
+								throw new Error('Failed to download pack: ' + response.statusText);
+							}
+							return response.blob();
+						}).then(function(blob) {
+							// Cache in background (don't wait)
+							self.cachePack(url, version, blob).catch(function() {});
+							return blob;
+						});
+					});
+				}
+			};
+		})();
+
+		(function() {
+			const EXECUTABLE_NAME = 'index';
+			
+			// Support .pck URL from query parameter (Supabase CDN)
+			const urlParams = new URLSearchParams(window.location.search);
+			const pckFromUrl = urlParams.get('pck');
+			const MAIN_PACK = pckFromUrl || 'index.pck';
+			console.log('[Godot] Using pack file:', pckFromUrl ? 'Supabase CDN' : 'local');
+
+			const INDETERMINATE_STATUS_STEP_MS = 100;
+
+			var canvas = document.getElementById('canvas');
+			var statusProgress = document.getElementById('status-progress');
+			var statusProgressInner = document.getElementById('status-progress-inner');
+			var statusIndeterminate = document.getElementById('status-indeterminate');
+			var statusNotice = document.getElementById('status-notice');
+
+			var initializing = true;
+			var statusMode = 'hidden';
+
+			var animationCallbacks = [];
+			function animate(time) {
+				animationCallbacks.forEach(callback => callback(time));
+				requestAnimationFrame(animate);
+			}
+			requestAnimationFrame(animate);
+
+			var resizeTimeout = null;
+			var lastPixelRatio = window.devicePixelRatio || 1;
+			
+			// Make this global so bridge can call it
+			window.adjustCanvasDimensions = function() {
+				var scale = window.devicePixelRatio || 1;
+				var width = window.innerWidth;
+				var height = window.innerHeight;
+				
+				// Only update if dimensions actually changed
+				var newWidth = Math.floor(width * scale);
+				var newHeight = Math.floor(height * scale);
+				
+				if (canvas.width !== newWidth || canvas.height !== newHeight) {
+					canvas.width = newWidth;
+					canvas.height = newHeight;
+					canvas.style.width = width + 'px';
+					canvas.style.height = height + 'px';
+					console.log('[Godot] Canvas resized:', newWidth, 'x', newHeight, 'scale:', scale);
+				}
+			};
+			
+			// Debounced resize handler for smoother resizing
+			function debouncedResize() {
+				if (resizeTimeout) clearTimeout(resizeTimeout);
+				resizeTimeout = setTimeout(window.adjustCanvasDimensions, 100);
+			}
+			
+			// Check for pixel ratio changes (dev tools, display changes)
+			function checkPixelRatioChange() {
+				var currentRatio = window.devicePixelRatio || 1;
+				if (currentRatio !== lastPixelRatio) {
+					lastPixelRatio = currentRatio;
+					window.adjustCanvasDimensions();
+				}
+			}
+			
+			// Initial resize with multiple attempts to ensure correct dimensions
+			// (iframe may not have final size immediately)
+			window.adjustCanvasDimensions();
+			setTimeout(window.adjustCanvasDimensions, 50);
+			setTimeout(window.adjustCanvasDimensions, 150);
+			setTimeout(window.adjustCanvasDimensions, 300);
+			setTimeout(window.adjustCanvasDimensions, 500);
+			setTimeout(window.adjustCanvasDimensions, 1000);
+			
+			window.addEventListener('resize', debouncedResize);
+			
+			// Also handle visibility changes and focus (can affect pixel ratio)
+			document.addEventListener('visibilitychange', function() {
+				if (!document.hidden) {
+					setTimeout(window.adjustCanvasDimensions, 100);
+				}
+			});
+			
+			// Check pixel ratio periodically (catches dev tools open/close)
+			setInterval(checkPixelRatioChange, 500);
+
+			setStatusMode = function setStatusMode(mode) {
+				if (statusMode === mode || !initializing)
+					return;
+				[statusProgress, statusIndeterminate, statusNotice].forEach(elem => {
+					elem.style.display = 'none';
+				});
+				animationCallbacks = animationCallbacks.filter(function(value) {
+					return (value != animateStatusIndeterminate);
+				});
+				switch (mode) {
+					case 'progress':
+						statusProgress.style.display = 'block';
+						break;
+					case 'indeterminate':
+						statusIndeterminate.style.display = 'block';
+						animationCallbacks.push(animateStatusIndeterminate);
+						break;
+					case 'notice':
+						statusNotice.style.display = 'block';
+						break;
+					case 'hidden':
+						break;
+					default:
+						throw new Error('Invalid status mode');
+				}
+				statusMode = mode;
+			}
+
+			function animateStatusIndeterminate(ms) {
+				var i = Math.floor(ms / INDETERMINATE_STATUS_STEP_MS % 8);
+				if (statusIndeterminate.children[i].style.borderTopColor == '') {
+					Array.prototype.slice.call(statusIndeterminate.children).forEach(child => {
+						child.style.borderTopColor = '';
+					});
+					statusIndeterminate.children[i].style.borderTopColor = '#dfdfdf';
+				}
+			}
+
+			setStatusNotice = function setStatusNotice(text) {
+				while (statusNotice.lastChild) {
+					statusNotice.removeChild(statusNotice.lastChild);
+				}
+				var lines = text.split('\n');
+				lines.forEach((line) => {
+					statusNotice.appendChild(document.createTextNode(line));
+					statusNotice.appendChild(document.createElement('br'));
+				});
+			};
+
+			// Send real progress to React parent
+			engine.setProgressFunc((current, total) => {
+				if (total > 0) {
+					var progress = current / total;
+					// Notify React of loading progress
+					if (window.parent && window.parent !== window) {
+						window.parent.postMessage({ type: 'godot_progress', progress: progress }, '*');
+					}
+					statusProgressInner.style.width = progress * 100 + '%';
+					setStatusMode('progress');
+					if (current === total) {
+						setTimeout(() => {
+							setStatusMode('indeterminate');
+						}, 500);
+					}
+				} else {
+					setStatusMode('indeterminate');
+				}
+			});
+
+			function displayFailureNotice(err) {
+				var msg = err.message || err;
+				console.error('[Godot] Error:', msg);
+				setStatusNotice(msg);
+				setStatusMode('notice');
+				initializing = false;
+				// Notify React of error
+				if (window.parent && window.parent !== window) {
+					window.parent.postMessage({ type: 'godot_error', message: msg }, '*');
+				}
+			};
+
+			// Load pack with IndexedDB caching
+			function loadPackWithCache() {
+				// Only use cache for remote URLs, not local files
+				if (pckFromUrl && pckFromUrl.startsWith('http')) {
+					window.godotCache.downloadPack(pckFromUrl, PACK_VERSION).then(function(blob) {
+						// Create object URL from cached/downloaded blob
+						var packUrl = URL.createObjectURL(blob);
+						engine.setCanvas(canvas);
+						engine.startGame(EXECUTABLE_NAME, packUrl).then(function() {
+							setStatusMode('hidden');
+							initializing = false;
+							console.log('[Godot] Engine started successfully');
+							// Notify React that engine is ready
+							if (window.parent && window.parent !== window) {
+								window.parent.postMessage({ type: 'godot_ready', version: '1.0' }, '*');
+							}
+						}, displayFailureNotice);
+					}).catch(function(err) {
+						console.warn('[Godot] Cache download failed, trying direct load:', err);
+						// Fallback to direct load if cache fails
+						engine.setCanvas(canvas);
+						engine.startGame(EXECUTABLE_NAME, MAIN_PACK).then(function() {
+							setStatusMode('hidden');
+							initializing = false;
+							console.log('[Godot] Engine started successfully (direct load)');
+							if (window.parent && window.parent !== window) {
+								window.parent.postMessage({ type: 'godot_ready', version: '1.0' }, '*');
+							}
+						}, displayFailureNotice);
+					});
+				} else {
+					// Local file, no caching needed
+					engine.setCanvas(canvas);
+					engine.startGame(EXECUTABLE_NAME, MAIN_PACK).then(function() {
+						setStatusMode('hidden');
+						initializing = false;
+						console.log('[Godot] Engine started successfully');
+						if (window.parent && window.parent !== window) {
+							window.parent.postMessage({ type: 'godot_ready', version: '1.0' }, '*');
+						}
+					}, displayFailureNotice);
+				}
+			}
+
+			if (!Engine.isWebGLAvailable()) {
+				displayFailureNotice('WebGL not available');
+			} else {
+				setStatusMode('indeterminate');
+				try { loadPackWithCache(); } catch (e) { displayFailureNotice('启动失败: ' + (e && e.message ? e.message : e)); }
+			}
+		})();
+	//]]></script>
+
+
+<script>
+/* 本地增强（微特 V-TASK）：顶层打开时取 sessionStorage 车型/贴图自动加载 + 小车加载进度 HUD */
+(function(){
+  try {
+    var m = null, t = null;
+    try { m = sessionStorage.getItem('ws3d_model'); t = sessionStorage.getItem('ws3d_tex'); } catch(e){}
+    if (!m) return;
+    var hud = document.createElement('div');
+    hud.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:99999;padding:14px 20px calc(20px + env(safe-area-inset-bottom,0px));background:linear-gradient(transparent,rgba(11,17,32,.92));text-align:center;font-family:-apple-system,BlinkMacSystemFont,sans-serif;';
+    hud.innerHTML = '<div style="position:relative;height:28px;margin:0 4px;">'
+      + '<div style="position:absolute;left:0;right:0;bottom:6px;height:4px;border-radius:2px;background:rgba(148,163,184,.35);"></div>'
+      + '<div id="vcar" style="position:absolute;bottom:0;left:0;font-size:24px;animation:vcar 7s linear infinite;">\ud83d\ude97</div></div>'
+      + '<div id="vtip" style="font-size:12px;color:#94a3b8;margin-top:6px;">\u8f66\u6a21\u52a0\u8f7d\u4e2d\u2026\u9996\u6b21\u7ea61\u5206\u949f</div>'
+      + '<style>@keyframes vcar{0%{left:0}50%{left:calc(100% - 28px)}100%{left:0}}</style>';
+    document.body.appendChild(hud);
+    var car = hud.querySelector('#vcar'), tip = hud.querySelector('#vtip');
+    var done = function(){
+      try { car.style.animation = 'none'; car.style.left = 'calc(100% - 28px)'; tip.textContent = '\u5b8c\u6210\uff01'; } catch(e){}
+      setTimeout(function(){ if (hud.parentNode) hud.parentNode.removeChild(hud); }, 1200);
+    };
+    window.addEventListener('error', function(ev){
+      try { tip.textContent = '页面错误: ' + (ev.message || ''); } catch(e2){}
+    });
+    window.addEventListener('message', function(ev){
+      var d = ev.data;
+      if (d && d.type === 'godot_error'){
+        try { tip.textContent = '加载失败: ' + (d.message || '引擎错误'); } catch(e2){}
+      }
+      if (d && d.type === 'godot_progress' && typeof d.progress === 'number'){
+        try {
+          car.style.animation = 'none';
+          car.style.left = 'calc(' + Math.max(0, Math.min(96, Math.round(d.progress))) + '% - 28px)';
+          tip.textContent = '\u4e0b\u8f7d\u8f66\u6a21\u5305 ' + Math.round(d.progress) + '%';
+        } catch(e){}
+      }
+    });
+    var dbg = document.createElement('div');
+    dbg.style.cssText = 'font-size:10px;color:#64748b;margin-top:4px;';
+    hud.appendChild(dbg);
+    var dv = setInterval(function(){
+      try {
+        var s1 = (typeof window.Engine !== 'undefined') ? 'Engine✓' : 'Engine✗';
+        var s2 = '-';
+        try { s2 = window.Engine && window.Engine.isWebGLAvailable ? (window.Engine.isWebGLAvailable() ? 'WebGL✓' : 'WebGL✗') : '?'; } catch(e){ s2 = 'WebGLerr'; }
+        var s3 = (window.godot && window.godot.isReady && window.godot.isReady()) ? 'ready✓' : 'ready…';
+        dbg.textContent = s1 + ' ' + s2 + ' ' + s3;
+      } catch(e){}
+    }, 1000);
+    var iv = setInterval(function(){
+      if (!(window.godot && window.godot.isReady && window.godot.isReady())) return;
+      clearInterval(iv); clearInterval(dv);
+      window.godot.sendMessage({ type: 'load_scene', modelId: m });
+      try { sessionStorage.removeItem('ws3d_model'); } catch(e){}
+      if (t) setTimeout(function(){
+        window.godot.sendMessage({ type: 'set_texture', texture: t });
+        try { sessionStorage.removeItem('ws3d_tex'); } catch(e){}
+        window.godot.sendMessage({ type: 'set_camera_angle', horizontal: 35, vertical: 15, distance: 12 });
+        done();
+      }, 2500);
+      else done();
+    }, 500);
+    setTimeout(function(){ clearInterval(iv); }, 180000);
+  } catch(e){}
+})();
+</script>
+</body>
+</html>

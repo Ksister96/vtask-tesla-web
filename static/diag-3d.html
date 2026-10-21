@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>3D 预览诊断</title>
+<style>
+  body{margin:0;padding:14px;font:13px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#0b1120;color:#e5e9f0;}
+  h1{font-size:16px;margin:0 0 10px;}
+  #log{white-space:pre-wrap;word-break:break-all;background:#111a2c;border:1px solid rgba(148,163,184,.25);border-radius:10px;padding:10px;font:11px/1.6 ui-monospace,Consolas,monospace;min-height:200px;}
+  .ok{color:#4ade80;} .bad{color:#f87171;} .info{color:#94a3b8;}
+  iframe{width:100%;height:220px;border:1px solid rgba(148,163,184,.3);border-radius:10px;background:#000;}
+</style>
+</head>
+<body>
+<h1>3D 预览诊断（约 30 秒跑完，截屏发我）</h1>
+<div id="log"></div>
+<iframe id="f" src="about:blank"></iframe>
+<script>
+(function(){
+  var log = document.getElementById('log');
+  function msg(t, cls){
+    var d = document.createElement('div');
+    d.className = cls || '';
+    d.textContent = new Date().toTimeString().slice(0,8) + ' ' + t;
+    log.appendChild(d);
+  }
+  window.addEventListener('error', function(e){ msg('页面JS错误: ' + e.message, 'bad'); });
+  msg('UA: ' + navigator.userAgent, 'info');
+  var conn = navigator.connection;
+  if (conn) msg('网络: type=' + (conn.type||'?') + ' effectiveType=' + (conn.effectiveType||'?') + ' saveData=' + conn.saveData, 'info');
+
+  // ① HEAD 探测
+  fetch('/wraps3d/index.pck', { method: 'HEAD' }).then(function(r){
+    msg('① HEAD index.pck -> ' + r.status + (r.ok ? '（本地车模包存在）' : '（不存在！）'), r.ok ? 'ok' : 'bad');
+  }).catch(function(e){ msg('① HEAD 失败: ' + e.message, 'bad'); });
+
+  // ② 流式读 2MB 测速
+  var t0 = Date.now();
+  fetch('/wraps3d/index.pck').then(function(r){
+    var reader = r.body.getReader();
+    var got = 0;
+    function pump(){
+      return reader.read().then(function(c){
+        if (c.done || got >= 2*1024*1024){ reader.cancel(); return; }
+        got += c.value.length;
+        return pump();
+      });
+    }
+    return pump().then(function(){
+      var sec = (Date.now()-t0)/1000;
+      msg('② 流式读取 ' + (got/1048576).toFixed(2) + 'MB 用时 ' + sec.toFixed(1) + 's（' + (got/1048576/Math.max(sec,0.1)).toFixed(1) + ' MB/s）', 'ok');
+      startFrame();
+    });
+  }).catch(function(e){ msg('② 流式读取失败: ' + e.message, 'bad'); startFrame(); });
+
+  // ③ iframe 引擎页
+  function startFrame(){
+    msg('③ 加载引擎 iframe…', 'info');
+    var f = document.getElementById('f');
+    var loaded = false;
+    f.onload = function(){
+      loaded = true;
+      msg('③ iframe onload 触发', 'ok');
+      setTimeout(function(){
+        try {
+          var w = f.contentWindow;
+          w.addEventListener('error', function(e){ msg('③【引擎页JS错误】' + e.message, 'bad'); });
+          msg('③ 引擎页 readyState=' + w.document.readyState + '，canvas=' + !!w.document.getElementById('canvas'), 'info');
+          var st = w.document.getElementById('status-notice');
+          if (st && st.textContent) msg('③ 引擎页报错文本: ' + st.textContent, 'bad');
+        } catch(e){ msg('③ 引擎页读取失败(跨域?): ' + e.message, 'bad'); }
+      }, 1500);
+    };
+    f.src = '/wraps3d/index.html?pck=' + encodeURIComponent(location.origin + '/wraps3d/index.pck');
+    setTimeout(function(){ if (!loaded) msg('③ 10秒 iframe 未触发 onload！', 'bad'); }, 10000);
+    // 收引擎页 postMessage
+    window.addEventListener('message', function(ev){
+      var d = ev.data;
+      if (d && d.type) msg('③ 引擎消息: ' + d.type + (d.message ? ' ' + d.message : ''), d.type === 'godot_error' ? 'bad' : 'ok');
+    });
+  }
+})();
+</script>
+</body>
+</html>

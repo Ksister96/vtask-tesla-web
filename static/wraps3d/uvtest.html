@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>UV 标定</title>
+<style>body{margin:0;overflow:hidden;background:#0b1120;} #i{position:fixed;top:8px;left:8px;color:#4ade80;font:13px monospace;z-index:9;}</style>
+<script type="importmap">
+{"imports":{"three":"/wraps3d/lib/three.module.js","three/addons/":"/wraps3d/lib/"}}
+</script>
+</head>
+<body>
+<div id="i">UV标定中…</div>
+<script type="module">
+import * as THREE from '/wraps3d/lib/three.module.js';
+import { GLTFLoader } from '/wraps3d/lib/loaders/GLTFLoader.js';
+import { OrbitControls } from '/wraps3d/lib/controls/OrbitControls.js';
+
+const info = document.getElementById('i');
+// 四象限标定贴图：左上红=1 右上绿=2 左下蓝=3 右下黄=4，带方位文字
+const cv = document.createElement('canvas'); cv.width = 1024; cv.height = 1024;
+const g = cv.getContext('2d');
+g.fillStyle = '#ff0000'; g.fillRect(0, 0, 512, 512);
+g.fillStyle = '#00cc44'; g.fillRect(512, 0, 512, 512);
+g.fillStyle = '#0066ff'; g.fillRect(0, 512, 512, 512);
+g.fillStyle = '#ffcc00'; g.fillRect(512, 512, 512, 512);
+g.fillStyle = '#fff'; g.font = 'bold 120px sans-serif';
+g.fillText('1上左', 150, 300); g.fillText('2上右', 660, 300);
+g.fillText('3下左', 150, 820); g.fillText('4下右', 660, 820);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1120);
+const camera = new THREE.PerspectiveCamera(40, innerWidth/innerHeight, 0.1, 200);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.AmbientLight(0xffffff, 1.3));
+const d = new THREE.DirectionalLight(0xffffff, 2); d.position.set(5, 8, 6); scene.add(d);
+const controls = new OrbitControls(camera, renderer.domElement);
+
+// 测试 A：flipY=false
+const tex = new THREE.Texture(cv);
+tex.flipY = true;
+tex.colorSpace = THREE.SRGBColorSpace;
+tex.needsUpdate = true;
+
+new GLTFLoader().load('models/ModelY_High_slim.glb?v=uv2', (gltf) => {
+  const car = gltf.scene;
+  const box = new THREE.Box3().setFromObject(car);
+  const c = box.getCenter(new THREE.Vector3());
+  car.position.sub(c);
+  let n = 0;
+  car.traverse(o => {
+    if (o.isMesh) {
+      const ms = Array.isArray(o.material) ? o.material : [o.material];
+      ms.forEach(m => { if (/^Paint/i.test(m.name)) { m.map = tex; m.color = new THREE.Color(0xffffff); m.needsUpdate = true; n++; } });
+    }
+  });
+  scene.add(car);
+  info.textContent = 'flipY=false, Paint材质 ' + n + ' 个。车身主色=采样区域：红=模板上部被翻到下…';
+  camera.position.set(4.6, 2.2, 5.6);
+  controls.target.set(0, 0.6, 0);
+  (function loop(){ requestAnimationFrame(() => { controls.update(); renderer.render(scene, camera); loop(); }); })();
+}, undefined, (e) => { info.textContent = 'ERR ' + e; });
+</script>
+</body>
+</html>

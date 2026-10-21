@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>换肤动画验证页</title>
+<style>
+  body{margin:0;background:#10161d;color:#dfe6ec;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;display:flex;flex-direction:column;align-items:center;min-height:100vh}
+  h3{margin:10px 0 4px;font-size:15px}
+  .tip{font-size:12px;color:#8a93a5;margin-bottom:8px}
+  iframe{width:min(96vw,560px);height:56vh;border:0;border-radius:14px;background:#000}
+  .btns{display:flex;gap:10px;margin:12px 0 4px}
+  button{padding:12px 22px;border:none;border-radius:14px;font-size:15px;font-weight:600;cursor:pointer}
+  #bA{background:#c0392b;color:#fff}
+  #bB{background:#2471a3;color:#ffe66d}
+  #st{font-size:13px;color:#7ed957;margin:6px 0 2px;min-height:18px}
+</style>
+</head>
+<body>
+<h3>换肤扫过动画验证页（沙箱专用）</h3>
+<div class="tip">点按钮换皮：应看到新皮从车头往车尾扫过（约0.75秒）。「慢放×8」放大观赛。</div>
+<iframe id="f" src="about:blank"></iframe>
+<div class="btns">
+  <button id="bA">红色皮 A</button>
+  <button id="bB">蓝色皮 B</button>
+  <button id="bS">慢放 ×8</button>
+  <button id="bM">方向 0</button>
+</div>
+<div id="st">先点一次 A 或 B 上皮 →「慢放×8」→ 点「方向」循环 0/1/2/3，哪个扫向是「主驾→副驾」就停在哪个号</div>
+<script>
+const f = document.getElementById('f'), st = document.getElementById('st');
+// 每次打开都用新地址加载 3D 页，绕开一切缓存层
+f.src = 'uvcars.html?m=modely&theme=light&r=' + Date.now();
+const DIR_NAMES = ['0：左→右', '1：右→左', '2：上→下', '3：下→上'];
+let mode = 0;
+try { mode = sessionStorage.getItem('fx_mode') || 0; } catch(e){}
+document.getElementById('bM').textContent = '方向 ' + mode;
+document.getElementById('bM').onclick = () => {
+  const w = f.contentWindow;
+  mode = w.__fxSetMode ? w.__fxSetMode((+mode + 1) % 4) : (+mode + 1) % 4;
+  document.getElementById('bM').textContent = '方向 ' + mode + '（' + DIR_NAMES[+mode] + '）';
+  st.textContent = '方向已切到 ' + mode + '，换一次皮看扫向';
+};
+function design(bg, fg, txt){
+  const c = document.createElement('canvas'); c.width = 1024; c.height = 1024;
+  const g = c.getContext('2d');
+  g.fillStyle = bg; g.fillRect(0, 0, 1024, 1024);
+  g.fillStyle = fg; g.font = 'bold 300px sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(txt, 512, 512);
+  return c.toDataURL('image/png');
+}
+function push(color, txt){
+  try { f.contentWindow.postMessage({ __uvcars: 1, wrap: design(color, txt.color, txt.t) }, '*'); } catch(e){ st.textContent = 'ERR ' + e; }
+  st.textContent = '已推送 ' + txt.t + ' 皮…';
+}
+document.getElementById('bA').onclick = () => push('#c0392b', { color: '#fff', t: 'A' });
+document.getElementById('bB').onclick = () => push('#2471a3', { color: '#ffe66d', t: 'B' });
+document.getElementById('bS').onclick = () => {
+  const w = f.contentWindow;
+  const res = w.__fxSetDur ? w.__fxSetDur(6000) : 'no-hook';
+  st.textContent = '慢放: ' + res + '（下次换皮生效）';
+};
+</script>
+</body>
+</html>

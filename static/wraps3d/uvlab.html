@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>UV Lab — 车模贴图实验室</title>
+<style>
+  body{margin:0;overflow:hidden;background:#0b1120;font-family:ui-monospace,Consolas,'PingFang SC',monospace;}
+  #info{position:fixed;top:10px;left:10px;color:#4ade80;font-size:12px;z-index:9;white-space:pre-wrap;text-shadow:0 1px 2px #000;}
+  #err{position:fixed;top:70px;left:10px;color:#f87171;font-size:12px;z-index:9;max-width:90vw;}
+  #bar{position:fixed;bottom:calc(12px + env(safe-area-inset-bottom,0px));left:50%;transform:translateX(-50%);display:flex;gap:8px;z-index:9;}
+  .btn{padding:8px 14px;border-radius:8px;background:rgba(30,41,59,.9);color:#e2e8f0;font-size:12px;cursor:pointer;border:1px solid rgba(148,163,184,.3);user-select:none;}
+  .btn.on{background:#166534;border-color:#22c55e;}
+</style>
+<script type="importmap">
+{"imports":{"three":"/wraps3d/lib/three.module.js","three/addons/":"/wraps3d/lib/"}}
+</script>
+</head>
+<body>
+<div id="info">初始化…</div>
+<div id="err"></div>
+<div id="bar">
+  <div class="btn" id="b-flip">flipY: true</div>
+  <div class="btn" id="b-wire">线框: 关</div>
+  <div class="btn" id="b-ext">外饰贴图: 开</div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const info = document.getElementById('info');
+const errEl = document.getElementById('err');
+window.addEventListener('error', e => { errEl.textContent = 'JS错误: ' + e.message; });
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1120);
+const camera = new THREE.PerspectiveCamera(40, innerWidth/innerHeight, 0.1, 200);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+const key = new THREE.DirectionalLight(0xffffff, 2.0); key.position.set(5, 8, 6); scene.add(key);
+const fill = new THREE.DirectionalLight(0xdde7ff, 0.8); fill.position.set(-6, 4, -5); scene.add(fill);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 0.6, 0);
+camera.position.set(4.6, 2.2, 5.6);
+
+// 官方模板贴图
+const texLoader = new THREE.TextureLoader();
+let wrapTex = texLoader.load('/wraps/modely.png', t => { t.colorSpace = THREE.SRGBColorSpace; t.needsUpdate = true; });
+wrapTex.colorSpace = THREE.SRGBColorSpace;
+wrapTex.flipY = true;
+
+let extOn = true;
+const loader = new GLTFLoader();
+loader.load('models/ModelY_High_slim.glb?v=uv2', (gltf) => {
+  const car = gltf.scene;
+  const box = new THREE.Box3().setFromObject(car);
+  const c = box.getCenter(new THREE.Vector3());
+  car.position.sub(c);
+  scene.add(car);
+  let paint = 0, ext = 0, paintNames = new Set(), extNames = new Set();
+  car.traverse(o => {
+    if (!o.isMesh) return;
+    const ms = Array.isArray(o.material) ? o.material : [o.material];
+    ms.forEach(m => {
+      if (/^Paint/i.test(m.name)) { m.map = wrapTex; m.color = new THREE.Color(0xffffff); m.needsUpdate = true; paint++; paintNames.add(m.name); }
+      else if (/^Exterior/i.test(m.name)) { m.map = wrapTex; m.color = new THREE.Color(0xffffff); m.needsUpdate = true; ext++; extNames.add(m.name); }
+    });
+  });
+  info.textContent = '车漆材质 ' + paint + ' 个 [' + [...paintNames].join(',') + ']\n外饰材质 ' + ext + ' 个 [' + [...extNames].join(',') + ']\n模型加载完成，拖动旋转查看';
+}, (ev) => {
+  if (ev.total) info.textContent = '模型加载 ' + Math.round(ev.loaded/ev.total*100) + '%';
+}, (e) => {
+  errEl.textContent = 'GLB 加载失败: ' + (e.message || e);
+});
+
+// flipY 切换
+let flip = true;
+document.getElementById('b-flip').addEventListener('click', function(){
+  flip = !flip;
+  this.textContent = 'flipY: ' + flip;
+  this.classList.toggle('on', !flip);
+  wrapTex.flipY = flip;
+  wrapTex.needsUpdate = true;
+});
+// 线框
+let wire = false;
+document.getElementById('b-wire').addEventListener('click', function(){
+  wire = !wire;
+  this.textContent = '线框: ' + (wire ? '开' : '关');
+  this.classList.toggle('on', wire);
+  scene.traverse(o => { if (o.isMesh && /^Paint/i.test(o.material.name || '')) o.material.wireframe = wire; });
+});
+// 外饰贴图开关
+document.getElementById('b-ext').addEventListener('click', function(){
+  extOn = !extOn;
+  this.textContent = '外饰贴图: ' + (extOn ? '开' : '关');
+  this.classList.toggle('on', extOn);
+  scene.traverse(o => {
+    if (!o.isMesh) return;
+    const ms = Array.isArray(o.material) ? o.material : [o.material];
+    ms.forEach(m => {
+      if (/^Exterior/i.test(m.name)) { m.map = extOn ? wrapTex : null; m.color = new THREE.Color(extOn ? 0xffffff : 0x1a1a2e); m.needsUpdate = true; }
+    });
+  });
+});
+
+(function loop(){ requestAnimationFrame(() => { controls.update(); renderer.render(scene, camera); loop(); }); })();
+</script>
+</body>
+</html>

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>YL 尾门方向诊断</title>
+<script type="importmap">
+{"imports":{"three":"/wraps3d/lib/three.module.js","three/addons/":"/wraps3d/lib/"}}
+</script>
+<style>
+body{margin:0;background:#0b1120;font-family:sans-serif;}
+#hud{position:fixed;top:6px;left:6px;color:#0f0;font-size:14px;z-index:9;white-space:pre-line;}
+</style>
+</head>
+<body>
+<div id="hud">加载中…</div>
+<canvas id="c"></canvas>
+<script type="importmap">
+{"imports":{"three":"/wraps3d/lib/three.module.js","three/addons/":"/wraps3d/lib/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const hud = document.getElementById('hud');
+const say = t => { hud.textContent = t; };
+const canvas = document.getElementById('c');
+canvas.width = 1100; canvas.height = 760;
+canvas.style.width = '1100px'; canvas.style.height = '760px';
+
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true, preserveDrawingBuffer:true});
+renderer.setPixelRatio(1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1120);
+const camera = new THREE.PerspectiveCamera(40, 1100/760, 0.1, 100);
+camera.position.set(0, 1.45, 4.9);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 0.95, 0);
+controls.autoRotate = false;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x333344, 1.2));
+const dir = new THREE.DirectionalLight(0xffffff, 1.4);
+dir.position.set(3, 8, 5);
+scene.add(dir);
+
+// 地面
+const ground = new THREE.Mesh(new THREE.CircleGeometry(9, 64),
+  new THREE.MeshStandardMaterial({color:0x1b2534, roughness:0.95}));
+ground.rotation.x = -Math.PI/2; ground.position.y = -0.02;
+scene.add(ground);
+
+// 方向标记纹理（画在 1024 画布 = 模板坐标；尾门 cell 约 x 296-711, y 653-911）
+const tc = document.createElement('canvas'); tc.width = 1024; tc.height = 1024;
+const tx = tc.getContext('2d');
+tx.fillStyle = '#e8e8e8'; tx.fillRect(0, 0, 1024, 1024);
+// 尾门 cell 区域放大标注
+tx.fillStyle = '#ffffff'; tx.fillRect(296, 653, 415, 258);
+tx.strokeStyle = '#ff0000'; tx.lineWidth = 6; tx.strokeRect(296, 653, 415, 258);
+tx.fillStyle = '#000'; tx.font = 'bold 44px sans-serif'; tx.textAlign = 'center';
+tx.fillText('上端（靠窗）', 503, 700);
+tx.fillText('下端（靠牌）', 503, 880);
+tx.fillStyle = '#c00'; tx.font = 'bold 40px sans-serif';
+tx.fillText('L端', 340, 790);
+tx.fillText('R端', 660, 790);
+// 全图画布四角大字（判断整体朝向）
+tx.fillStyle = '#00c'; tx.font = 'bold 60px sans-serif';
+tx.fillText('画布顶部', 380, 60);
+tx.fillText('画布底部', 380, 1000);
+const tex = new THREE.CanvasTexture(tc);
+tex.flipY = false; tex.colorSpace = THREE.SRGBColorSpace; tex.channel = 1;
+tex.anisotropy = 4;
+
+const loader = new GLTFLoader();
+let wrapN = 0;
+loader.load('/wraps3d/models/BayberryE80_cars_slim.glb?v=y8s2', (gltf) => {
+  const model = gltf.scene;
+  model.traverse(o => {
+    if (!o.isMesh) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    const mn = mats.map(m => (m.name || '')).join(',');
+    // 只给 Paint 系（贴膜层）上标记
+    if (/Paint/i.test(mn)){
+      o.material.map = tex;
+      o.material.color.set(0xffffff);
+      o.material.roughness = 0.4; o.material.metalness = 0.05;
+      o.material.needsUpdate = true;
+      wrapN++;
+    }
+    if (/Glass/i.test(mn)) { o.material.color.set(0x111620); }
+  });
+  scene.add(model);
+  say('wrap=' + wrapN + '\n红框=尾门cell 上=靠窗 下=靠牌\nL/R=左右方向\n相机: 正车尾');
+}, undefined, (e) => say('加载失败: ' + e));
+
+renderer.setAnimationLoop(() => { renderer.render(scene, camera); });
+</script>
+</body>
+</html>

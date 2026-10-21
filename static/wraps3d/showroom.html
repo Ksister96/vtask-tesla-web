@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tesla 车型展示 — 官方色 45°</title>
+<style>
+  html,body{margin:0;height:100%;background:#e8eaec;overflow:hidden;font-family:system-ui,sans-serif}
+  #c{width:100%;height:100%;display:block;touch-action:none}
+  #hud{position:fixed;left:10px;top:10px;color:#111;font-size:12px;z-index:9;white-space:pre-line}
+  #tip{position:fixed;right:10px;top:10px;color:#111;font-size:11px;z-index:9}
+  .carlabel{position:fixed;transform:translate(-50%,-100%);text-align:center;pointer-events:none;z-index:5;
+    font-size:12px;color:#000;text-shadow:0 1px 3px rgba(255,255,255,.75);white-space:nowrap}
+  .carlabel b{display:block;font-size:13px}
+  .carlabel .dot{display:inline-block;width:10px;height:10px;border-radius:50%;border:1px solid rgba(0,0,0,.25);
+    vertical-align:middle;margin-right:4px}
+</style>
+<script type="importmap">
+{"imports":{"three":"/wraps3d/lib/three.module.js?v=uv2","three/addons/":"/wraps3d/lib/"}}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">加载中…</div>
+<div id="tip">点击任意车 → 45° 特写 ｜ 点空白处 → 返回全景</div>
+<div id="labels"></div>
+<script>
+window.addEventListener('error', function(e){
+  document.getElementById('hud').textContent = 'LOAD-ERR: ' + (e.message || e.filename || 'unknown');
+});
+window.addEventListener('unhandledrejection', function(e){
+  document.getElementById('hud').textContent = 'REJ: ' + e.reason;
+});
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ---- 车型配置（复制自 uvcars.html 的车型库，源文件未改动）----
+ * 每台车指定特斯拉官网现行车漆（色值取自 tesla.cn 设计页官方色板图中心取色） */
+const PAINTS = {
+  stealth:  { name: '星空灰', hex: '#57575C' },
+  pearl:    { name: '珍珠白（多涂层）', hex: '#F2F2F2' },
+  glacier:  { name: '冰河蓝', hex: '#8CB0D9' },
+  diamond:  { name: '星钻黑', hex: '#434344' },
+  ultrared: { name: '烈焰红', hex: '#A64748' },
+  quick:    { name: '快银', hex: '#B1B1B1' },
+};
+
+const CARS = [
+  { id: 'modely',   label: '老款 Model Y',    glb: '/wraps3d/models/ModelY_High_ofuv5.glb?v=ofuv5d',
+    paint: 'stealth',
+    extTex: '/wraps3d/models/tex/Exterior_BC_Y_High.png?v=ofuv5',
+    primClass: { 'Body': {0:'ext',1:'wrap',2:'ext',3:'ext',4:'rough'},
+      'Door_LF': {0:'ext',1:'wrap',2:'rough'}, 'Door_LF_Mirror': {0:'ext',1:'wrap'},
+      'Door_LR': {0:'ext',1:'wrap',2:'rough'}, 'Door_RF': {0:'ext',1:'wrap',2:'rough'},
+      'Door_RF_Mirror': {0:'ext',1:'wrap'}, 'Door_RR': {0:'ext',1:'wrap',2:'rough'},
+      'Hood': {0:'wrap',1:'ext'}, 'Trunk': {0:'ext',1:'ext',2:'wrap',3:'ext',4:'rough'} },
+    hideMeshes: [] },
+  { id: 'model3',   label: '老款 Model 3',    glb: '/wraps3d/models/Model3_High_cars.glb?v=m3c',
+    paint: 'diamond',
+    primClass: { 'Body': {0:'ext',1:'wrap',3:'rough'}, 'Charge_Cap': {1:'ext'},
+      'Door_LF': {0:'wrap',1:'ext',2:'rough'}, 'Door_LF_Mirror': {0:'wrap',1:'ext'},
+      'Door_LR': {0:'ext',1:'wrap',2:'rough'}, 'Door_RF': {0:'wrap',1:'ext',2:'rough'},
+      'Door_RF_Mirror': {0:'wrap',1:'ext'}, 'Door_RR': {0:'ext',1:'wrap',2:'rough'},
+      'Hood': {0:'ext',1:'wrap'}, 'Lights_Glass': {1:'ext'},
+      'Trunk': {0:'ext',1:'wrap'}, 'Trunk_Bracket1': {0:'wrap',1:'ext'},
+      'Trunk_Bracket2': {0:'wrap',1:'ext'} },
+    hideMeshes: [] },
+  { id: 'model3h',  label: '新款 Model 3',    glb: '/wraps3d/models/Poppyseed_cars.glb?v=pp4',
+    paint: 'pearl',
+    templates: null,
+    hideMeshes: ['Bumper_F_Perf', 'Bumper_R_Perf', 'Spoiler', 'Fade'] },
+  { id: 'model3p',  label: '新款 Model 3P',   glb: '/wraps3d/models/Poppyseed_cars.glb?v=pp4',
+    paint: 'quick',
+    wheelGlb: '/wraps3d/models/Wheel_Wishbone20.glb?v=wb1',
+    wheelMounts: [[1.5, 0.332, -0.725, Math.PI], [1.5, 0.332, 0.725, 0],
+                  [-1.375, 0.332, -0.73, Math.PI], [-1.375, 0.332, 0.73, 0]],
+    hideMeshes: ['Bumper_F_Base', 'Bumper_R_Base', 'Fade', 'WheelCar'] },
+  { id: 'modelyl',  label: 'Model Y L',       glb: '/wraps3d/models/BayberryE80_cars.glb?v=y8',
+    paint: 'glacier',
+    hideMeshes: [] },
+  { id: 'modely25', label: '新款Y·对照',      glb: '/wraps3d/models/BayberryE41_cars.glb?v=b8',
+    paint: 'ultrared',
+    hideMeshes: ['HighBeam_Left', 'HighBeam_Right'],
+    primClass: { 'Static_Exterior': {2:'cvrB', 5:'clad', 10:'tailLamp', 11:'tailLamp'},
+      'Hood': {1:'cvrB', 3:'clad'},
+      'Front_Left_Door': {2:'cvrB', 5:'clad'}, 'Front_Right_Door': {2:'cvrB', 5:'clad'},
+      'Back_Left_Door': {2:'cvrB', 5:'clad'}, 'Back_Right_Door': {2:'cvrB', 5:'clad'},
+      'Trunk_Cover_Main': {4:'clad'},
+      'DRL_Left': {0:'lamp', 2:'hide'}, 'DRL_Right': {0:'lamp', 2:'hide'} },
+    wheelY: 0, wheelIn: 0, tireR: 0.335, groundY: 0 },
+  { id: 'modely25b', label: '新款 Model Y',   glb: '/wraps3d/models/Bayberry2_cars.glb?v=bb1',
+    paint: 'pearl',
+    hideMeshes: ['Fascia_Perf', 'Spoiler_Perf', 'Seats_Perf', 'DRL', 'Headlights_On',
+      'Fog_Light_On', 'Parking_Lights_On', 'Brake_Lights_On', 'Left_Turn_Signal_On',
+      'Right_Turn_Signal_On', 'Back_Left_Turn_Signal_On', 'Back_Right_Turn_Signal_On',
+      'Parking_Light_Projection', 'Headlights_Beam', 'LeftGlow', 'RightGlow', 'HorizontalGlow',
+      'Tesla_Badge', 'Plate_US', 'Plate_EU', 'RHD', 'Doorcard_LF_RHD', 'Doorcard_RF_RHD',
+      'Skullcap_LF_SierraBlack', 'Skullcap_RF_SierraBlack', 'Defrost_Front', 'Defrost_Rear',
+      'BrakeLightProjection', 'HeadLightProjection', 'Reverse Light On'],
+    official: ['BrakeLightProjection', 'HeadLightProjection', 'Tesla_Badge', 'Plate_US', 'Plate_EU',
+      'DRL', 'Headlights_On', 'Fog_Light_On', 'Parking_Lights_On', 'Parking_Light_Projection',
+      'Brake_Lights_On', 'Left_Turn_Signal_On', 'Right_Turn_Signal_On',
+      'Back_Left_Turn_Signal_On', 'Back_Right_Turn_Signal_On',
+      'LeftGlow', 'RightGlow', 'HorizontalGlow', 'Headlights_Beam',
+      'RHD', 'Doorcard_LF_RHD', 'Doorcard_RF_RHD',
+      'Skullcap_LF_SierraBlack', 'Skullcap_RF_SierraBlack',
+      'Defrost_Front', 'Defrost_Rear', 'Spoiler_Perf', 'Fascia_Perf', 'Seats_Perf'],
+    wheelY: 0, wheelIn: 0, tireR: 0.335, groundY: 0 },
+];
+
+/* ---- 场景 ---- */
+const hud = document.getElementById('hud');
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 300);
+camera.position.set(0, 16, 33);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+window.__orbit = controls; window.__cam = camera; window.__THREE = THREE;
+
+/* ---- 金色金属质感：拉丝渐变贴图（背景/地面）+ 程序化金色环境反射（车漆） ---- */
+function goldCanvas(w, h, top, mid, bottom, streaks){
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const cx = cv.getContext('2d');
+  const g = cx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, top); g.addColorStop(0.45, mid); g.addColorStop(1, bottom);
+  cx.fillStyle = g; cx.fillRect(0, 0, w, h);
+  // 拉丝横纹
+  cx.globalAlpha = 0.045;
+  for (let i = 0; i < streaks; i++){
+    const y = Math.random() * h;
+    cx.strokeStyle = Math.random() > 0.5 ? '#f2e7c4' : '#57472a';
+    cx.lineWidth = Math.random() * 1.6 + 0.4;
+    cx.beginPath(); cx.moveTo(0, y); cx.lineTo(w, y + (Math.random() * 8 - 4)); cx.stroke();
+  }
+  // 中央高光晕
+  cx.globalAlpha = 0.24;
+  const rg = cx.createRadialGradient(w / 2, h * 0.52, 10, w / 2, h * 0.52, w * 0.55);
+  rg.addColorStop(0, '#f4ecd2'); rg.addColorStop(1, 'rgba(244,236,210,0)');
+  cx.fillStyle = rg; cx.fillRect(0, 0, w, h);
+  cx.globalAlpha = 1;
+  return cv;
+}
+const bgTex = new THREE.CanvasTexture(
+  goldCanvas(1024, 512, '#6e5c33', '#cdbd8f', '#a08a52', 220));
+bgTex.colorSpace = THREE.SRGBColorSpace;
+scene.background = bgTex;
+
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(220, 220),
+  new THREE.MeshStandardMaterial({
+    map: new THREE.CanvasTexture(goldCanvas(1024, 1024, '#9c8a5a', '#c2b183', '#8a744a', 380)),
+    roughness: 0.42, metalness: 0.35 }));
+ground.material.map.colorSpace = THREE.SRGBColorSpace;
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+// 程序化金色环境（PMREM）：车漆/金属件反射出金色光泽
+{
+  const env = new THREE.Scene();
+  const envGeo = new THREE.SphereGeometry(50, 32, 16);
+  const envCv = goldCanvas(512, 256, '#6e5c33', '#e8dcba', '#a08a52', 60);
+  const envMat = new THREE.MeshBasicMaterial({side: THREE.BackSide});
+  const envTex = new THREE.CanvasTexture(envCv);
+  envTex.colorSpace = THREE.SRGBColorSpace;
+  envMat.map = envTex;
+  env.add(new THREE.Mesh(envGeo, envMat));
+  const strip = (x, y, z, w2, h2) => {
+    const p = new THREE.Mesh(new THREE.PlaneGeometry(w2, h2),
+      new THREE.MeshBasicMaterial({color: 0xfff6dd}));
+    p.position.set(x, y, z); p.lookAt(0, 0, 0); env.add(p);
+  };
+  strip(0, 24, 0, 30, 8); strip(-24, 8, 14, 14, 5); strip(24, 8, -14, 14, 5);
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmrem.fromScene(env, 0.04).texture;
+  pmrem.dispose();
+}
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a7430, 1.2));
+const key = new THREE.DirectionalLight(0xffffff, 1.5);
+key.position.set(18, 26, 14);
+scene.add(key);
+const fill = new THREE.DirectionalLight(0xffe9b8, 0.55);
+fill.position.set(-16, 10, -12);
+scene.add(fill);
+
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+/* ---- 材质 ---- */
+function matClass(mn){
+  if (mn === 'Paint' || mn === 'PaintFade' || mn === 'Paint2') return 'wrap';
+  if (mn === 'Exterior' || mn === 'ExteriorFade' || mn === 'Exterior_Perf') return 'ext';
+  if (mn === 'PaintRough' || mn === 'Paint_Rough_Perf') return 'rough';
+  if (mn === 'TireDark') return 'tire';
+  if (mn === 'RimSilver') return 'rim';
+  if (mn === 'RotorSteel') return 'rotor';
+  if (mn === 'CaliperPaint') return 'caliper';
+  if (mn === 'UnderbodyDark') return 'under';
+  if (/^Glass|MirrorFade/.test(mn)) return 'glass';
+  if (mn === 'standardSurface2' || mn === 'aistandardsuface') return 'lens';
+  if (mn === 'Light_Off') return 'lamp';
+  if (/^(Light|Light_Global|LightsFade|Illumination|Fog_Cover|Chargeport|Grille|Reflector|GlossyBlack|DRL_)/.test(mn)) return 'lamp';
+  if (/Projection$/.test(mn) || mn === 'Ground_Plane' || mn === 'GroundPlane' || mn === 'Beam') return 'hide';
+  if (mn === 'Plates') return 'plate';
+  if (mn === 'Spoiler' || mn === 'Cover' || mn === 'Cover_Fade') return 'paint';
+  return 'interior';
+}
+const SHARED = {
+  glass: new THREE.MeshStandardMaterial({color: 0x080b10, transparent: true, opacity: 0.72,
+    roughness: 0.05, metalness: 0.25, side: THREE.DoubleSide}),
+  lamp: new THREE.MeshStandardMaterial({color: 0x3a4046, roughness: 0.25, metalness: 0.3, side: THREE.DoubleSide}),
+  lens: new THREE.MeshStandardMaterial({color: 0xc9d2d9, roughness: 0.3, metalness: 0.15,
+    transparent: true, opacity: 0.92, side: THREE.DoubleSide}),
+  interior: new THREE.MeshStandardMaterial({color: 0x1d1f23, roughness: 0.85, side: THREE.DoubleSide}),
+  tire: new THREE.MeshStandardMaterial({color: 0x0c0d0f, roughness: 0.95, side: THREE.DoubleSide}),
+  rim: new THREE.MeshStandardMaterial({color: 0xcfd4da, roughness: 0.35, metalness: 0.35, side: THREE.DoubleSide}),
+  rotor: new THREE.MeshStandardMaterial({color: 0x8f9398, roughness: 0.45, metalness: 0.8, side: THREE.DoubleSide}),
+  caliper: new THREE.MeshStandardMaterial({color: 0xd8dbde, roughness: 0.4, metalness: 0.3, side: THREE.DoubleSide}),
+  plate: new THREE.MeshStandardMaterial({color: 0xd8dadb, roughness: 0.5, side: THREE.DoubleSide}),
+  under: new THREE.MeshStandardMaterial({color: 0x131418, roughness: 0.9, side: THREE.DoubleSide}),
+  clad: new THREE.MeshStandardMaterial({color: 0x000919, roughness: 0.55, side: THREE.DoubleSide}),
+  tailLamp: new THREE.MeshStandardMaterial({color: 0x2a0e0a, roughness: 0.28, metalness: 0.15, side: THREE.DoubleSide}),
+  cvrB: new THREE.MeshStandardMaterial({color: 0x060606, roughness: 0.3, side: THREE.DoubleSide}),
+};
+
+/* ---- 装载 7 台车：上下两排错位陈列（后排 3 台 / 前排 4 台） ---- */
+const ROW_BACK_Z = -6, ROW_FRONT_Z = 6;
+const SLOTS = [
+  { x: -7.2, z: ROW_BACK_Z }, { x: 0, z: ROW_BACK_Z }, { x: 7.2, z: ROW_BACK_Z },
+  { x: -10.8, z: ROW_FRONT_Z }, { x: -3.6, z: ROW_FRONT_Z }, { x: 3.6, z: ROW_FRONT_Z },
+  { x: 10.8, z: ROW_FRONT_Z },
+];
+const loader = new GLTFLoader();
+const cars = [];              // {cfg, group, x, z}
+const labelsBox = document.getElementById('labels');
+let loaded = 0;
+const t0 = performance.now();
+
+CARS.forEach((cfg, idx) => {
+  const paint = PAINTS[cfg.paint];
+  const slot = SLOTS[idx];
+  // 整体斜 30° 陈列：两排在画面上对角错开，单车近似 45° 朝向
+  const ang = THREE.MathUtils.degToRad(30);
+  const gx = slot.x * Math.cos(ang) + slot.z * Math.sin(ang);
+  const gz = -slot.x * Math.sin(ang) + slot.z * Math.cos(ang);
+  const group = new THREE.Group();
+  group.position.set(gx, 0, gz);
+  group.rotation.y = ang;
+  const paintMat = new THREE.MeshStandardMaterial({color: paint.hex, roughness: 0.32, metalness: 0.12, side: THREE.DoubleSide});
+  const extMat = new THREE.MeshStandardMaterial({color: paint.hex, roughness: 0.35, metalness: 0.08, side: THREE.DoubleSide});
+  const roughMat = new THREE.MeshStandardMaterial({color: paint.hex, roughness: 0.62, metalness: 0.0, side: THREE.DoubleSide});
+  if (cfg.extTex){
+    const t = new THREE.TextureLoader().load(cfg.extTex);
+    t.flipY = false; t.colorSpace = THREE.SRGBColorSpace;
+    extMat.map = t; extMat.needsUpdate = true;
+  }
+  const MATS = {wrap: paintMat, ext: extMat, rough: roughMat, paint: extMat,
+    glass: SHARED.glass, lamp: SHARED.lamp, lens: SHARED.lens, interior: SHARED.interior,
+    tire: SHARED.tire, rim: SHARED.rim, rotor: SHARED.rotor, caliper: SHARED.caliper,
+    plate: SHARED.plate, under: SHARED.under, clad: SHARED.clad, tailLamp: SHARED.tailLamp,
+    cvrB: SHARED.cvrB, hide: null};
+
+  loader.load(cfg.glb, (gltf) => {
+    const car = gltf.scene;
+    window['__car_' + cfg.id] = car;
+    const assoc = gltf.parser.associations;
+    const jnames = gltf.parser.json.meshes.map(m => (m && m.name) || '');
+    const globalHide = new Set(jnames.filter(nm => nm.endsWith('_GLOBAL') && jnames.includes(nm.slice(0, -7))));
+    car.traverse(o => {
+      if (!o.isMesh) return;
+      if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+      const a = assoc.get(o) || {};
+      const mi = a.meshes;
+      if (mi === undefined) return;
+      const base = jnames[mi] || ('mesh' + mi);
+      const pidx = a.primitives || 0;
+      const gmat = gltf.parser.json.meshes[mi].primitives[pidx] && gltf.parser.json.meshes[mi].primitives[pidx].material;
+      const matName = (gmat !== undefined && gltf.parser.json.materials[gmat]) ? gltf.parser.json.materials[gmat].name || '?' : '?';
+      if (globalHide.has(base) || (cfg.hideMeshes || []).includes(base) ||
+          ['Floor', 'Headlights_Projections', 'Taillights_Projection', 'Stoplights_Projection'].includes(base)){
+        o.visible = false; return;
+      }
+      if (cfg.official && cfg.official.includes(base)){ o.visible = false; return; }
+      let cls = null;
+      const pc = cfg.primClass && cfg.primClass[base];
+      if (pc) cls = pc[pidx];
+      if (!cls) cls = matClass(matName);
+      if (cls === 'hide'){ o.visible = false; return; }
+      if (cls === 'wrap' || cls === 'ext' || cls === 'rough' || cls === 'paint'){
+        o.material = MATS[cls];
+        return;
+      }
+      if (cls === 'glass' || cls === 'tire' || cls === 'rim' || (cfg.official && cls !== 'plate')){
+        if (cfg.official){ if (cls === 'glass' || cls === 'tire' || cls === 'rim') o.material = MATS[cls]; return; }
+      }
+      o.material = MATS[cls] || SHARED.interior;
+    });
+    // 轮心落地修正（对照款等）
+    if (cfg.tireR !== undefined){
+      car.updateMatrixWorld(true);
+      car.traverse(o => {
+        if (!o.isMesh) return;
+        let p = o, nm = '';
+        for (let d = 0; d < 4 && p; d++){ if (/^Wheel_(FL|FR|RL|RR)$/.test(p.name)) { nm = p.name; break; } p = p.parent; }
+        if (!nm) return;
+        const wpv = new THREE.Vector3(); p.getWorldPosition(wpv);
+        const sign = wpv.x >= 0 ? 1 : -1;
+        p.position.x += (sign * 0.781) - wpv.x;
+        p.position.y += ((cfg.tireR || 0.335) + (cfg.groundY || 0)) - wpv.y;
+      });
+    }
+    // 独立轮 GLB（3P wishbone）
+    if (cfg.wheelGlb){
+      new GLTFLoader().load(cfg.wheelGlb, (wg) => {
+        const proto = wg.scene;
+        for (const [wx, wy, wz, ry] of cfg.wheelMounts){
+          const w = proto.clone();
+          w.position.set(wx, wy, wz);
+          w.rotation.y = ry;
+          car.add(w);
+        }
+      }, undefined, () => {});
+    }
+    group.add(car);
+    cars.push({cfg, group, x: gx, z: gz, paint, center: null});
+    // 标签
+    const div = document.createElement('div');
+    div.className = 'carlabel';
+    div.innerHTML = '<b>' + cfg.label + '</b><span class="dot" style="background:' + paint.hex + '"></span>' + paint.name;
+    labelsBox.appendChild(div);
+    group.userData.labelDiv = div;
+    loaded++;
+    hud.textContent = '已加载 ' + loaded + ' / ' + CARS.length + ' 台 (用时' + Math.round(performance.now() - t0) + 'ms)';
+  }, undefined, (e) => {
+    hud.textContent = cfg.label + ' 加载失败: ' + e;
+  });
+  scene.add(group);
+});
+
+/* ---- 相机：全景 45° / 点击单车 45° 特写 ---- */
+const HOME_POS = new THREE.Vector3(13, 8, 34);
+const HOME_TGT = new THREE.Vector3(0, 0.5, 0);
+let focusCar = null;
+controls.target.copy(HOME_TGT);
+camera.position.copy(HOME_POS);
+
+const ray = new THREE.Raycaster();
+canvas.addEventListener('pointerdown', (e) => { canvas.__down = [e.clientX, e.clientY]; });
+canvas.addEventListener('pointerup', (e) => {
+  if (!canvas.__down) return;
+  const dx = e.clientX - canvas.__down[0], dy = e.clientY - canvas.__down[1];
+  canvas.__down = null;
+  if (dx * dx + dy * dy > 25) return;   // 拖动不算点击
+  const nd = new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(nd, camera);
+  const groups = cars.map(c => c.group);
+  const hits = ray.intersectObjects(groups, true);
+  if (hits.length){
+    let p = hits[0].object, hitGroup = null;
+    while (p){ hitGroup = cars.find(c => c.group === p); if (hitGroup) break; p = p.parent; }
+    if (hitGroup){ focus(hitGroup); return; }
+  }
+  unfocus();
+});
+function focus(c){
+  focusCar = c;
+  if (c.center === null){
+    const b = new THREE.Box3().setFromObject(c.group);
+    c.center = b.getCenter(new THREE.Vector3());
+  }
+  controls.target.copy(c.center);
+  camera.position.set(c.center.x + 4.6, c.center.y + 1.7, c.center.z + 4.6);
+  controls.update();
+}
+function unfocus(){
+  focusCar = null;
+  controls.target.copy(HOME_TGT);
+  camera.position.copy(HOME_POS);
+  controls.update();
+}
+
+/* ---- 标签投影跟随 ---- */
+const v3 = new THREE.Vector3();
+renderer.setAnimationLoop(() => {
+  controls.update();
+  renderer.render(scene, camera);
+  for (const c of cars){
+    const div = c.group.userData.labelDiv;
+    if (!div) continue;
+    if (focusCar && focusCar !== c){ div.style.display = 'none'; continue; }
+    v3.set(c.x, 2.1, c.z).project(camera);
+    if (v3.z > 1){ div.style.display = 'none'; continue; }
+    div.style.display = 'block';
+    div.style.left = ((v3.x * 0.5 + 0.5) * innerWidth) + 'px';
+    div.style.top = ((-v3.y * 0.5 + 0.5) * innerHeight - 8) + 'px';
+  }
+});
+</script>
+</body>
+</html>

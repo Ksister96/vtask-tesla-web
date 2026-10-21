@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>HK-SHOT</title>
+<style>
+  html,body{margin:0;padding:0;background:#111;overflow:hidden}
+  iframe{position:fixed;left:0;top:0;width:390px;height:844px;border:0;display:none}
+  #st{position:fixed;left:4px;top:4px;color:#0f0;font:11px monospace;z-index:9}
+  #slow{display:none}
+</style>
+</head>
+<body>
+<iframe id="f"></iframe>
+<img id="slow">
+<div id="st">init</div>
+<script>
+(async () => {
+  const q = new URLSearchParams(location.search);
+  const a = q.get('a') || 'home';
+  const D = q.get('d') || 12;
+  document.getElementById('slow').src = 'http://127.0.0.1:9377/slow.png?d=' + D;
+  const st = (s) => { document.getElementById('st').textContent = s; try { document.title = 'HK_' + s; } catch(e){} };
+  const show = () => { document.getElementById('f').style.display = 'block'; document.getElementById('st').style.display = 'none'; };
+  st('login');
+  const f = document.getElementById('f');
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+  await new Promise(res => { f.onload = res; f.src = '/'; });
+  // 等应用 DOM 就绪:已登录(chat 可见)或未登录(登录按钮,限频点击避免触发限流)
+  let doc = null;
+  let lastClick = 0, clicks = 0;
+  for (let i = 0; i < 200; i++) {
+    try {
+      const d2 = f.contentDocument;
+      if (d2 && d2.getElementById('chat') && !d2.getElementById('chat').classList.contains('hidden')) { doc = d2; break; }
+      if (d2 && d2.getElementById('login-btn') && clicks < 4 && Date.now() - lastClick > 4000) {
+        lastClick = Date.now(); clicks++;
+        const ci = d2.querySelector('#login input') || d2.querySelector('input');
+        if (ci && !ci.value) ci.value = '1234';
+        d2.getElementById('login-btn').click();
+      }
+    } catch (e) {}
+    await wait(150);
+  }
+  if (!doc) { st('noroot'); return; }
+  doc.querySelectorAll('button').forEach(b => { const t = b.textContent.trim(); if (t === '下次' || t === '稍后再填') b.click(); });
+  const sb = doc.getElementById('surveyBanner'); if (sb) sb.style.display = 'none';
+  const ib = doc.getElementById('install-bar'); if (ib) ib.style.display = 'none';
+  if (a === 'home') { await wait(2500); show(); st('done'); return; }
+  if (a === 'quick') {
+    await wait(1500);
+    doc.getElementById('qp-btn').click();
+    await wait(900);
+    show(); st('done'); return;
+  }
+  if (a === 'chat') {
+    await wait(1800);
+    const inp = doc.getElementById('input');
+    inp.value = '打开空调 21 度';
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+    inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+    await wait(5000);
+    show(); st('done'); return;
+  }
+  if (a === 'studio') {
+    await wait(1200);
+    doc.getElementById('stt-wrap-studio').click();
+    for (let i = 0; i < 80; i++) { const ws = doc.getElementById('wrap-studio'); if (ws && ws.classList.contains('open')) break; await wait(200); }
+    await wait(1500);
+    const cand = [...doc.querySelectorAll('button')].find(b => /3D/.test(b.textContent));
+    if (cand) cand.click();
+    await wait(10000);
+    show(); st('done'); return;
+  }
+  st('done');
+})();
+</script>
+</body>
+</html>
