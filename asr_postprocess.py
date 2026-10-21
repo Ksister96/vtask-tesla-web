@@ -8,7 +8,7 @@
   2. postprocess(text)      —— 确定性错字/同音纠正 + 时间表达规范化
 
 维护约定（重要）：车控语音的纠正表**只有这一份**。
-  本地 C:\\Users\\z1316\\scripts\\asr_postprocess.py
+  本地 <scripts>/asr_postprocess.py（Windows 部署机：C:\\Users\\<你>\\scripts\\）
   云端 /opt/tesla-asr/asr_postprocess.py
 两个引擎各自服务里**禁止再抄一份**，否则必然漂移。改动后两边同步覆盖。
 """
