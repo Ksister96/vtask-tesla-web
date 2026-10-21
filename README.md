@@ -25,6 +25,18 @@ SSE 实时车况、3D 车模仪表盘与贴膜工坊（WebGL）、行程地图�
 
 依赖：Python 3.11+，**全部标准库**；可选组件（ASR、命令代理）见 [DEPLOY.md](DEPLOY.md)。
 
+## 产品预览
+
+| 仪表盘 · 语音控车 | 行驶回顾 | 行驶详情 |
+|---|---|---|
+| <img src="docs/screenshots/dashboard-voice.jpg" width="280"> | <img src="docs/screenshots/trip-review.jpg" width="280"> | <img src="docs/screenshots/trip-detail.jpg" width="280"> |
+
+| 本周路书海报 | 登录 |
+|---|---|
+| <img src="docs/screenshots/trip-poster.jpg" width="280"> | <img src="docs/screenshots/login.jpg" width="280"> |
+
+<p align="right"><sub>截图为真机界面演示（车模贴膜为用户自定义皮肤）</sub></p>
+
 ## 快速开始
 
 ```bash
