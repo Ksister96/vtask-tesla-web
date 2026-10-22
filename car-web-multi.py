@@ -2654,6 +2654,10 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._api_push_test()
         elif path == "/api/monitor/set_name":
             self._api_monitor_set_name()
+        elif path == "/api/monitor/send":
+            self._api_monitor_send()
+        elif path == "/api/monitor/cleanup":
+            self._api_monitor_cleanup()
         elif path == "/api/mp/login":
             self._api_mp_login()
         else:
@@ -3873,12 +3877,29 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
         if q.get("pw") != MONITOR_KEY:
             self._json(401, {"ok": False, "error": "unauthorized"})
             return
-        users = []
+        import sqlite3
+        email_by_uid = {}
+        try:
+            con = sqlite3.connect(os.path.join(BASE, "identity.sqlite3"))
+            for _uid, _email in con.execute("SELECT uid, email FROM identities"):
+                email_by_uid[_uid] = _email
+            con.close()
+        except Exception:
+            pass
+        users, dead_uids = [], []
         user_names = _load_user_names()
         if os.path.isdir(USERS_DIR):
-            for uid in os.listdir(USERS_DIR):
+            for uid in sorted(os.listdir(USERS_DIR)):
                 ud = os.path.join(USERS_DIR, uid)
-                if not os.path.isdir(ud) or not os.path.exists(os.path.join(ud, "account.json")):
+                if not os.path.isdir(ud):
+                    continue
+                has_acct = os.path.exists(os.path.join(ud, "account.json"))
+                chats = self._try_json_json(os.path.join(ud, "chat.json")) or []
+                n_msgs = len(chats)
+                last_chat = chats[-1].get("ts", "") if isinstance(chats[-1] if chats else None, dict) else (chats[-1] if chats else "")
+                # 废账号：从未完成绑定、也从未有过任何消息（纯探测残留），单列供清理
+                if not has_acct and n_msgs == 0:
+                    dead_uids.append(uid)
                     continue
                 acct = get_account(uid) or {}
                 cars = acct.get("vehicles") or []
@@ -3895,8 +3916,13 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                 pst = get_pair_state(uid) or {}
                 pair_ready = pst.get("control_ready")
                 pair_ts = pst.get("ts")
+                last_act = last_chat or (ts_st or "")
                 users.append({
                     "uid": uid,
+                    "email": email_by_uid.get(uid, ""),
+                    "msgs": n_msgs,
+                    "last_chat": last_chat,
+                    "last_act": last_act,
                     "name": user_names.get(uid, ""),
                     "car": car0.get("display_name") or (car0.get("vin", "")[-6:]) or "未绑车",
                     "vin": (car0.get("vin", "")[-6:]) if car0.get("vin") else "",
@@ -3909,7 +3935,56 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                     "last_op": last_op,
                     "last_ts": ts_st,
                 })
-        self._json(200, {"ok": True, "users": users, "user_names": user_names})
+        # 活跃账号排前：按最近聊天/遥测时间倒序
+        users.sort(key=lambda u: (str(u.get("last_chat") or u.get("last_ts") or ""), u["uid"]), reverse=True)
+        self._json(200, {"ok": True, "users": users, "user_names": user_names,
+                         "dead_uids": dead_uids, "dead_count": len(dead_uids)})
+
+    def _api_monitor_send(self):
+        """监控大屏 → 指定账号发一条客服消息（落入其小程序聊天，下次刷新可见）。"""
+        q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())
+        if q.get("pw") != MONITOR_KEY:
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        ln = int(self.headers.get("Content-Length") or 0)
+        if ln <= 0 or ln > 10000:
+            self._json(400, {"ok": False, "error": "请求无效"})
+            return
+        data = json.loads(self.rfile.read(ln).decode("utf-8"))
+        uid = str(data.get("uid") or "")
+        text = str(data.get("text") or "").strip()
+        if not uid or not text:
+            self._json(400, {"ok": False, "error": "参数缺失"})
+            return
+        if len(text) > 500:
+            text = text[:500]
+        ud = os.path.join(USERS_DIR, uid)
+        if not os.path.isdir(ud):
+            self._json(404, {"ok": False, "error": "账号不存在"})
+            return
+        append_chat(uid, "car", text)
+        self._json(200, {"ok": True})
+
+    def _api_monitor_cleanup(self):
+        """清理废账号目录：无 account.json 且从未有消息的纯探测残留。"""
+        q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())
+        if q.get("pw") != MONITOR_KEY:
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        import shutil
+        removed = []
+        for uid in sorted(os.listdir(USERS_DIR)):
+            ud = os.path.join(USERS_DIR, uid)
+            if not os.path.isdir(ud):
+                continue
+            if os.path.exists(os.path.join(ud, "account.json")):
+                continue
+            chats = self._try_json_json(os.path.join(ud, "chat.json")) or []
+            if chats:
+                continue
+            shutil.rmtree(ud, ignore_errors=True)
+            removed.append(uid)
+        self._json(200, {"ok": True, "removed": removed})
 
     def _api_monitor_events(self):
         q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())
