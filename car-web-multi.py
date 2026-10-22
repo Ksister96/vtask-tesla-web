@@ -47,6 +47,7 @@ CODES_FILE = os.path.join(BASE, "friends-codes.json")
 EMAIL_AUTH = EmailAuthStore(BASE)   # 邮箱身份库 identity.sqlite3（邮箱→uid + 验证码挑战 + 频控）
 LOG_FILE = os.path.join(BASE, "multi-web.log")
 AMAP_KEY_FILE = os.path.join(BASE, "amap_key.txt")
+AMAP_MAP_SEM = threading.BoundedSemaphore(1)
 # 小程序（微信）凭据：环境变量注入；两者齐备走真 code2session，缺省为 mock 模式
 MP_WX_APPID = os.environ.get("MP_WX_APPID", "")
 MP_WX_SECRET = os.environ.get("MP_WX_SECRET", "")
@@ -226,7 +227,7 @@ MONITOR_EVENTS_MAX = 80
 # 默认仅本机回环；可用环境变量 CAR_HOST 临时放开（如 CAR_HOST=0.0.0.0 供局域网/手机联调）
 import os as _os
 HOST = _os.environ.get("CAR_HOST", "127.0.0.1")
-PORT = 8796
+PORT = 8794
 
 # 特斯拉（中国区）OAuth
 AUTH_URL = "https://auth.tesla.cn/oauth2/v3/authorize"
@@ -701,7 +702,7 @@ def save_user_tokens(uid, tok):
 
 
 # ---------- 控制授权（虚拟钥匙配对）状态 ----------
-PAIR_URL = "https://www.tesla.cn/_ak/pk.vtask.top"   # 2026-10-07 定版：vtask.top 10-06 首配失败被特斯拉配对层记负面缓存(预抓取即拒,重注册不清)；pk.vtask.top 全新子域一次配对成功+遥测域名检查通过
+PAIR_URL = "https://www.tesla.cn/_ak/pk2.vtask.top"   # 2026-10-22 轮换：pk 子域疑似负缓存，全新子域首配即成（10-07 同款解法）   # 2026-10-07 定版：vtask.top 10-06 首配失败被特斯拉配对层记负面缓存(预抓取即拒,重注册不清)；pk.vtask.top 全新子域一次配对成功+遥测域名检查通过
 _NOT_PAIRED_IN_REPLY = ("public key has not been paired", "not been paired",
                         "vehicle rejected request", "rejected request")
 
@@ -1670,8 +1671,10 @@ def _action_label(action, params=None):
 
 # 高频单动作本地快解析：命中就不起解析子进程，任务清单毫秒级先回给用户
 _FAST_RULES = [
-    (("锁车", "锁门", "把车锁", "车上锁", "锁好车"), "door_lock", {}),
+    # 解锁必须先于锁车（"解锁车辆"含"锁车"子串，run.py/user_runner 同款修复），
+    # 否则复合指令「解锁车辆，…」第一段被解析成 door_lock，锁/解锁颠倒属危险级
     (("解锁", "开门", "打开车门"), "door_unlock", {}),
+    (("锁车", "锁门", "把车锁", "车上锁", "锁好车"), "door_lock", {}),
     (("闪灯", "闪一下灯"), "flash_lights", {}),
     (("鸣笛", "按喇叭", "响个喇叭"), "honk_horn", {}),
     (("开空调", "打开空调", "开暖风", "开冷风"), "auto_conditioning_start", {}),
@@ -2175,6 +2178,123 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         with open(fp, encoding="utf-8") as f:
             self._send(200, f.read(), "application/json; charset=utf-8")
 
+    def _api_trip_map(self, query):
+        """同源代理高德静态地图，避免浏览器 ORB/CORS 拦截行程地图和分享海报。"""
+        s = self._auth()
+        if not s:
+            token = (query.get("token") or [""])[0]
+            s = check_session(token) if token else None
+        if not s:
+            self._json(401, {"ok": False, "error": "未登录"})
+            return
+
+        key = load_amap_key()
+        if not key:
+            self._json(503, {"ok": False, "error": "地图服务未配置"})
+            return
+
+        zoom = (query.get("zoom") or [""])[0]
+        size = (query.get("size") or [""])[0]
+        location = (query.get("location") or [""])[0]
+        paths = (query.get("paths") or [""])[0]
+        markers = (query.get("markers") or [""])[0]
+        if (not re.fullmatch(r"(?:[5-9]|1[0-7])", zoom)
+                or not re.fullmatch(r"\d{2,4}\*\d{2,4}", size)
+                or not re.fullmatch(r"-?\d{1,3}(?:\.\d{1,8})?,-?\d{1,2}(?:\.\d{1,8})?", location)
+                or len(paths) > 24000 or len(markers) > 1000):
+            self._json(400, {"ok": False, "error": "地图参数错误"})
+            return
+
+        # 保留路线参数，让高德静态图同时返回真实底图和轨迹线；请求由下方串行重试控制。
+        amap_paths = paths
+        amap_markers = markers
+        amap_query = {
+            "key": key,
+            "zoom": zoom,
+            "size": size,
+            "location": location,
+        }
+        if amap_paths:
+            amap_query["paths"] = amap_paths
+        if amap_markers:
+            amap_query["markers"] = amap_markers
+        params = urllib.parse.urlencode(amap_query)
+
+        def fallback_svg():
+            wh = re.fullmatch(r"(\d{2,4})\*(\d{2,4})", size)
+            width, height = (int(wh.group(1)), int(wh.group(2))) if wh else (480, 180)
+            points = []
+            raw = paths.split(":", 1)[1] if ":" in paths else ""
+            for pair in raw.split(";")[:1000]:
+                try:
+                    lon, lat = [float(v) for v in pair.split(",", 1)]
+                    if -180 <= lon <= 180 and -90 <= lat <= 90:
+                        points.append((lon, lat))
+                except Exception:
+                    pass
+            if points:
+                min_lon = min(p[0] for p in points)
+                max_lon = max(p[0] for p in points)
+                min_lat = min(p[1] for p in points)
+                max_lat = max(p[1] for p in points)
+                dx = max(max_lon - min_lon, 0.0001)
+                dy = max(max_lat - min_lat, 0.0001)
+                pad = 22
+                coords = [
+                    "%0.1f,%0.1f" % (
+                        pad + (lon - min_lon) / dx * (width - 2 * pad),
+                        height - pad - (lat - min_lat) / dy * (height - 2 * pad),
+                    )
+                    for lon, lat in points[::max(1, len(points) // 160)]
+                ]
+                route = '<polyline points="%s" fill="none" stroke="#49d17d" stroke-width="%s" stroke-linecap="round" stroke-linejoin="round"/>' % (
+                    " ".join(coords), max(3, min(8, width // 100)),
+                ) if len(coords) > 1 else ""
+            else:
+                route = ""
+            grid = []
+            for x in range(max(1, width // 6), width, max(1, width // 6)):
+                grid.append('<path d="M%d 0V%d" stroke="#ffffff" stroke-opacity=".08"/>' % (x, height))
+            for y in range(max(1, height // 4), height, max(1, height // 4)):
+                grid.append('<path d="M0 %dH%d" stroke="#ffffff" stroke-opacity=".08"/>' % (y, width))
+            return ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">'
+                    '<rect width="100%%" height="100%%" fill="#163047"/>%s%s</svg>' %
+                    (width, height, width, height, "".join(grid), route)).encode("utf-8")
+
+        def fetch_amap(query_string):
+            for attempt in range(3):
+                try:
+                    req = urllib.request.Request(
+                        "https://restapi.amap.com/v3/staticmap?" + query_string,
+                        headers={"User-Agent": "V-TASK/1.0"},
+                    )
+                    with AMAP_MAP_SEM:
+                        with urllib.request.urlopen(req, timeout=8) as resp:
+                            data = resp.read(8 * 1024 * 1024 + 1)
+                            ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+                    if len(data) <= 8 * 1024 * 1024 and ctype.startswith("image/"):
+                        return data, ctype
+                except Exception:
+                    pass
+                if attempt < 2:
+                    time.sleep(0.35)
+            return None
+
+        result = fetch_amap(params)
+        if not result and amap_paths:
+            # 路线参数被高德拒绝时，重试同中心真实底图，而不是直接返回深色 SVG。
+            base_params = urllib.parse.urlencode({
+                "key": key,
+                "zoom": zoom,
+                "size": size,
+                "location": location,
+            })
+            result = fetch_amap(base_params)
+        if result:
+            self._send(200, result[0], result[1])
+        else:
+            self._send(200, fallback_svg(), "image/svg+xml")
+
     def _api_wrap_save(self):
         """喷漆记忆：保存当前工坊状态（车型/颜色/填充图/贴纸+3D合成图），按用户隔离。
         ?beacon=1 路径：sendBeacon 无法带自定义头，token 经 query 传入（pagehide 抢救用）。"""
@@ -2363,6 +2483,12 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         if path == "/" or path == "/index.html":
             self._serve_file("index.html", "text/html; charset=utf-8")
             return
+        if path == "/login" or path == "/login.html":
+            self._serve_file("login.html", "text/html; charset=utf-8")
+            return
+        if path == "/privacy.html":
+            self._serve_file("privacy.html", "text/html; charset=utf-8")
+            return
         if path == "/manifest.json":
             self._serve_file("manifest.json", "application/manifest+json; charset=utf-8")
             return
@@ -2377,6 +2503,9 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             return
         if path == "/api/trip_detail":
             self._api_trip_detail(query)
+            return
+        if path == "/api/trip_map":
+            self._api_trip_map(query)
             return
         if path == "/test-trip.html":
             self._serve_file("test-trip.html", "text/html; charset=utf-8")
