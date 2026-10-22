@@ -702,7 +702,8 @@ def save_user_tokens(uid, tok):
 
 
 # ---------- 控制授权（虚拟钥匙配对）状态 ----------
-PAIR_URL = "https://www.tesla.cn/_ak/pk2.vtask.top"   # 2026-10-22 轮换：pk 子域疑似负缓存，全新子域首配即成（10-07 同款解法）   # 2026-10-07 定版：vtask.top 10-06 首配失败被特斯拉配对层记负面缓存(预抓取即拒,重注册不清)；pk.vtask.top 全新子域一次配对成功+遥测域名检查通过
+PAIR_URL = "https://www.tesla.cn/_ak/pk.vtask.top"   # 2026-10-23 复核：pk 负缓存已自然清除，恢复可用；
+   # pk2.vtask.top 备用（DNS/证书未配时勿启用，否则预抓取失败会立即拉黑）   # 2026-10-07 定版：vtask.top 10-06 首配失败被特斯拉配对层记负面缓存(预抓取即拒,重注册不清)；pk.vtask.top 全新子域一次配对成功+遥测域名检查通过
 _NOT_PAIRED_IN_REPLY = ("public key has not been paired", "not been paired",
                         "vehicle rejected request", "rejected request")
 
