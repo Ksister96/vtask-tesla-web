@@ -58,3 +58,7 @@ OWNER_BASE=<你的 fleet 基础库目录> python3 -X utf8 test_voice_matrix.py
 ## License
 
 [MIT](LICENSE)
+
+---
+
+**备案**：沪ICP备2026055578号（vtask.top）
