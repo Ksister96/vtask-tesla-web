@@ -38,6 +38,78 @@ def log(msg):
     print(line, flush=True)
 
 
+def sys_msg(uid, text):
+    """系统消息：写入用户聊天流（who=sys，2026-10-23 聊天框通知中心）。
+    与主应用 append_chat 跨进程并发，靠 .chat.lock flock 互斥防原子替换互踩。"""
+    import fcntl
+    text = str(text or "").strip()
+    if not text:
+        return
+    cp = os.path.join(USERS, uid, "chat.json")
+    try:
+        with open(os.path.join(USERS, uid, ".chat.lock"), "a+") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                try:
+                    messages = json.load(open(cp, encoding="utf-8"))
+                    if not isinstance(messages, list):
+                        messages = []
+                except Exception:
+                    messages = []
+                messages.append({"who": "sys", "text": text,
+                                 "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+                messages = messages[-100:]   # 与主应用 CHAT_MAX 对齐
+                tmp = cp + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(messages, f, ensure_ascii=False, indent=1)
+                os.replace(tmp, cp)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+    except Exception as e:
+        log(f"{uid} sys_msg err: {e}")
+
+
+def charge_watch(uid, cs):
+    """充电完成 / 低电量 → 聊天流系统消息（2026-10-23）。
+    状态存 users/<uid>/charge_watch.json 跨轮记忆；泊车驻车轮次也会走到这里
+    （poll_user 在驻车早退之前调用本函数，充电过夜同样能感知）。"""
+    try:
+        cur = (cs or {}).get("charging_state") or ""
+        soc = (cs or {}).get("battery_level")
+        pf = os.path.join(USERS, uid, "charge_watch.json")
+        try:
+            prev = json.load(open(pf, encoding="utf-8"))
+            if not isinstance(prev, dict):
+                prev = {}
+        except Exception:
+            prev = {}
+        pstate = prev.get("state") or ""
+        today = time.strftime("%Y%m%d")
+        msg = None
+        new = {"state": cur, "since": prev.get("since"), "low_day": prev.get("low_day") or ""}
+        if cur == "Charging" and pstate != "Charging":
+            new["since"] = time.time()
+        if pstate == "Charging" and cur == "Complete":
+            m = int(max(0, time.time() - (new.get("since") or time.time())) // 60)
+            dur = f"，用时 {m // 60}小时{m % 60:02d}分" if m >= 60 else (f"，用时 {m} 分钟" if m > 0 else "")
+            rng = (cs or {}).get("battery_range")
+            rng_s = f"，续航约 {round(float(rng) * 1.609344)} km" if rng else ""
+            msg = f"🔌 充电完成：当前 {soc}%{rng_s}{dur}"
+        if soc is not None and cur != "Charging" and soc < 20 and new["low_day"] != today:
+            msg = f"🔋 电量只剩 {soc}%，记得找桩充电"
+            new["low_day"] = today
+        if new != prev:
+            tmp = pf + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(new, f, ensure_ascii=False)
+            os.replace(tmp, pf)
+        if msg:
+            sys_msg(uid, msg)
+            log(f"{uid} 车况提醒: {msg}")
+    except Exception as e:
+        log(f"{uid} charge_watch err: {e}")
+
+
 def http_json(url, tok, timeout=20):
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
     with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
@@ -170,6 +242,7 @@ def poll_user(uid):
     ds2 = resp.get("drive_state") or {}
     cs = resp.get("charge_state") or {}
     cl = resp.get("climate_state") or {}
+    charge_watch(uid, cs)   # 充电完成/低电量 → 聊天流系统消息（须在驻车早退之前）
     if ds2.get("power") is not None:
         pt["pwr"] = round(float(ds2.get("power")), 1)   # kW：行驶为正/动能回收为负
     if cs.get("battery_level") is not None:
@@ -256,6 +329,14 @@ def settle_trip(uid, seg):
         tdir = os.path.join(BASE, "static", "test")
         os.makedirs(tdir, exist_ok=True)
         shutil.copy(fp, os.path.join(tdir, "trip_detail_latest.json"))
+    except Exception:
+        pass
+    # 行程完成 → 聊天流系统消息（2026-10-23 通知中心）
+    try:
+        s_addr = (detail.get("start_addr") or "").strip()
+        e_addr = (detail.get("end_addr") or "").strip()
+        tail = f"，从{s_addr[:12]}到{e_addr[:12]}" if s_addr and e_addr else ""
+        sys_msg(uid, f"🚗 行程完成：{_dist} km · {int(_dur_s // 60)} 分钟{tail}")
     except Exception:
         pass
     log("%s 行程结算 %s %.1fkm %d分钟" % (uid, detail["id"], _dist, _dur_s / 60))

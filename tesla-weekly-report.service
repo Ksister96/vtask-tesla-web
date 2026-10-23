@@ -1,0 +1,9 @@
+[Unit]
+Description=Tesla Weekly Driving Digest (push last-week report to user chats)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/tesla-fleet-multi
+ExecStart=/usr/bin/python3.11 -X utf8 /opt/tesla-fleet-multi/digest_weekly.py

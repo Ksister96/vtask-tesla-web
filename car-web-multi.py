@@ -32,6 +32,10 @@ from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import re
 import math
+try:
+    import fcntl
+except ImportError:
+    fcntl = None   # Windows 本地开发无 fcntl；服务器 Linux 必有
 
 import car_schedule_multi as schedule
 
@@ -875,6 +879,43 @@ def save_dashbtns(uid, ids):
         json.dump({"buttons":ids}, f, ensure_ascii=False, indent=2)
     os.replace(tmp, dashbtns_path(uid))
 
+# ---------- 一键场景（组合指令，2026-10-23）----------
+# 场景 = 名字 + 1~4 条指令文本；语音/文字命中名字即按序展开执行（走现有异步队列管线）
+SCENARIO_MAX = 8
+SCENARIO_STEPS_MAX = 4
+def scenarios_path(uid):
+    return os.path.join(user_dir(uid), "scenarios.json")
+def load_scenarios(uid):
+    try:
+        with open(scenarios_path(uid), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+def save_scenarios(uid, scenarios):
+    clean = []
+    for x in (scenarios or [])[:SCENARIO_MAX]:
+        if not isinstance(x, dict):
+            continue
+        name = str(x.get("name") or "").strip()[:16]
+        items = [str(i).strip()[:40] for i in (x.get("items") or []) if str(i).strip()][:SCENARIO_STEPS_MAX]
+        if name and items:
+            clean.append({"name": name, "items": items})
+    os.makedirs(user_dir(uid), exist_ok=True)
+    tmp = scenarios_path(uid) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(clean, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, scenarios_path(uid))
+    return clean
+def match_scenario(uid, text):
+    t = (text or "").strip()
+    if not t:
+        return None
+    for x in load_scenarios(uid):
+        if isinstance(x, dict) and (x.get("name") or "").strip() == t:
+            return x
+    return None
+
 # ---------- 用户设置 ----------
 DEFAULT_SETTINGS = {
     "topic": "自动",        # 主题：浅色 | 深色 | 自动
@@ -941,9 +982,17 @@ def append_chat(uid, who, text):
     if not text:
         return
     with _chat_lock:
-        messages = load_chat(uid)
-        messages.append({"who": who, "text": text, "ts": now_iso()})
-        save_chat(uid, messages)
+        # flock 与 track_watcher 的 sys_msg 跨进程互斥（2026-10-23），防原子替换互踩丢消息
+        with open(os.path.join(user_dir(uid), ".chat.lock"), "a+") as lf:
+            if fcntl:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                messages = load_chat(uid)
+                messages.append({"who": who, "text": text, "ts": now_iso()})
+                save_chat(uid, messages)
+            finally:
+                if fcntl:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
 
 # ---------- 会话 ----------
 def make_session(code, name, uid=None):
@@ -2576,6 +2625,9 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         if path == "/api/chat/history":
             self._api_chat_history()
             return
+        if path == "/api/scenarios":
+            self._api_scenarios_get()
+            return
         if path == "/api/chat/job":
             self._api_chat_job()
             return
@@ -2638,6 +2690,8 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._api_dashbtns_save()
         elif path == "/api/settings":
             self._api_settings_save()
+        elif path == "/api/scenarios":
+            self._api_scenarios_save()
         elif path == "/api/transcribe":
             self._api_transcribe()
         elif path == "/api/schedule/confirm":
@@ -3375,6 +3429,23 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
             return
         log_line("chat", f"{s['name']}({s['uid']}): {text}")
         uid = s["uid"]
+        # 一键场景：命中场景名 → 拆成多条指令依序入队（走现有异步队列，逐条回结果）
+        scen = match_scenario(uid, text)
+        if scen:
+            items = [str(x).strip() for x in (scen.get("items") or []) if str(x).strip()][:SCENARIO_STEPS_MAX]
+            if items:
+                first_job = ""
+                for it in items:
+                    jid, _pos = _enqueue_job(uid, it, tasks=[it])
+                    if not first_job:
+                        first_job = jid
+                append_chat(s["uid"], "me", text)
+                reply = f"🎬 场景「{scen.get('name')}」开始执行：{len(items)} 步依次进行，结果逐条出现"
+                append_chat(s["uid"], "car", reply)
+                self._json(200, {"ok": True, "mode": "async", "job": first_job,
+                                 "n": len(items), "tasks": items, "sleep": False,
+                                 "reply": reply, "pos": 1})
+                return
         # 若当前用户正忙，不拒绝、不让用户稍等，直接收下进入排队队列！
         with _user_queues_lock:
             in_flight = bool(_user_queues.get(uid))
@@ -3618,6 +3689,23 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
             self._json(401, {"ok": False, "error": "未登录或会话过期"}); return
         messages = load_chat(s["uid"])
         self._json(200, {"ok": True, "messages": messages})
+
+    def _api_scenarios_get(self):
+        s = self._auth()
+        if not s:
+            self._json(401, {"ok": False, "error": "未登录或会话过期"}); return
+        self._json(200, {"ok": True, "scenarios": load_scenarios(s["uid"])})
+
+    def _api_scenarios_save(self):
+        s = self._auth()
+        if not s:
+            self._json(401, {"ok": False, "error": "未登录或会话过期"}); return
+        data = self._parse_json() or {}
+        if not isinstance(data.get("scenarios"), list):
+            self._json(400, {"ok": False, "error": "格式错误：需要 scenarios 数组"}); return
+        clean = save_scenarios(s["uid"], data["scenarios"])
+        log_line("settings", f"{s['name']}({s['uid']}) 保存一键场景 {len(clean)} 个")
+        self._json(200, {"ok": True, "scenarios": clean})
 
     def _api_chat_job(self):
         """查询异步车控任务状态（休眠唤醒场景用）。GET /api/chat/job?job=ID"""

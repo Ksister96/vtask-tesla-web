@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly driving digest every Monday 08:30
+
+[Timer]
+OnCalendar=Mon *-*-* 08:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
