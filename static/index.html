@@ -1691,6 +1691,14 @@ body:not(.dark) .stt-drawer .stt-seg button:not(.on){border-color:rgba(148,163,1
 .stt-group{font-size:11px; font-weight:700; color:#8a93a5; letter-spacing:1px; margin:14px 0 6px;}
 
 .stt-group:first-child{margin-top:2px;}
+.scen-chips{display:flex;flex-wrap:wrap;gap:7px;margin:4px 0 10px;}
+.scen-chip{padding:6px 12px;border:1px solid rgba(148,163,184,.3);border-radius:999px;background:rgba(148,163,184,.08);color:#6b7787;font-size:12px;cursor:pointer;}
+.scen-chip.on{border-color:rgba(54,185,106,.65);background:rgba(54,185,106,.14);color:#1f7a4d;font-weight:600;}
+.scen-del{border:none;background:none;color:#d94b45;font-size:12px;cursor:pointer;flex:none;}
+.scen-btns{display:flex;gap:10px;margin:2px 0 8px;}
+.scen-btn{flex:1;padding:10px 0;border:1px solid rgba(148,163,184,.3);border-radius:11px;background:none;color:#6b7787;font-size:13px;cursor:pointer;}
+.scen-btn.main{border:none;background:rgba(54,185,106,.92);color:#fff;font-weight:600;}
+.qp-empty{grid-column:1/-1;padding:18px 10px;color:#8a93a5;font-size:12px;line-height:1.7;text-align:center;}
 
 .stt-row{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 13px; background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.07); border-radius:13px; margin-bottom:8px;}
 
@@ -3565,7 +3573,9 @@ body.dark #install-bar{background:linear-gradient(110deg,rgba(28,49,39,.92),rgba
 
     <div class="qp-tab" data-cat="空调">空调</div>
 
-    <div class="qp-tab" data-cat="安全">安全</div>
+    <div class="qp-tab" data-cat="场景">场景</div>
+
+<div class="qp-tab" data-cat="安全">安全</div>
 
   </div>
 
@@ -3695,7 +3705,41 @@ body.dark #install-bar{background:linear-gradient(110deg,rgba(28,49,39,.92),rgba
 
       </div>
 
-      <div class="stt-group">权限</div>
+      <div class="stt-group">一键场景</div>
+
+<div id="stt-scen-list"></div>
+
+<div class="stt-row" style="cursor:pointer;" id="stt-scen-add">
+
+<div class="stt-row-label">＋ 添加场景<small>把 1~4 步指令打包，语音喊名字就能执行</small></div>
+
+<span style="color:#8a93a5; font-size:13px;">添加</span>
+
+</div>
+
+<div id="stt-scen-editor" class="hidden">
+
+<div class="stt-row">
+
+<div class="stt-row-label">场景名<small>别和「锁车」这类常用指令重名</small></div>
+
+<input class="stt-input" id="stt-scen-name" maxlength="8" placeholder="如：离家模式" autocomplete="off">
+
+</div>
+
+<div class="scen-chips" id="stt-scen-chips"></div>
+
+<div class="stt-row">
+
+<div class="stt-row-label">已选 <span id="stt-scen-n">0</span> 步<small id="stt-scen-picked">点标签挑 1~4 步</small></div>
+
+</div>
+
+<div class="scen-btns"><button class="scen-btn" id="stt-scen-cancel" type="button">取消</button><button class="scen-btn main" id="stt-scen-save" type="button">保存场景</button></div>
+
+</div>
+
+<div class="stt-group">权限</div>
 
       <div class="stt-row" style="cursor:pointer;" id="stt-perm-notif-row">
 
@@ -5696,7 +5740,7 @@ var __locNode = null;   // 定位标签常驻节点：重建后挂回，不拆�
 
           refreshState();
 
-          enableNotifications(); pollNotifications();
+          enableNotifications(); pollNotifications(); initChatExtras();
 
           // 绑定后探测一次控制授权：若钥匙没配对 → 弹一次性引导（服务端记 control_ready，终身一次）
 
@@ -6136,9 +6180,9 @@ var __locNode = null;   // 定位标签常驻节点：重建后挂回，不拆�
 
       if(!messages.length) addMsg('sys','绑定后，直接说要干什么，比如「锁车」「开空调」「查电量」；设置 → 账户 可解绑车辆');
 
-      shown.forEach(m=>{ addMsg(m.who==='me'?'me':'car', m.text, m.ts); });
+      shown.forEach(m=>{ addMsg(m.who==='me'?'me':m.who, m.text, m.ts); });
 
-      main.scrollTop=main.scrollHeight;
+      main.scrollTop=main.scrollHeight; window.__chatLen=messages.length;
 
     }catch(e){}
 
@@ -6440,7 +6484,9 @@ var __locNode = null;   // 定位标签常驻节点：重建后挂回，不拆�
 
     const g=$('#qp-grid'); g.innerHTML='';
 
-    (QUICK[qpCat]||[]).forEach(it=>{
+    if(qpCat==='场景'){ if(!SCEN.length){ const e=document.createElement('div'); e.className='qp-empty'; e.textContent='还没有场景 · 到「设置 → 一键场景」创建，例如「离家模式」= 锁车+关空调+闪灯'; g.appendChild(e); return; } SCEN.forEach(function(s){ const d=document.createElement('div'); d.className='qp-item'; d.innerHTML='<span class="ic">🎬</span><span class="lb">'+dbEsc(s.name)+'</span>'; d.onclick=function(){ closeQuick(); sendText(s.name); }; g.appendChild(d); }); return; }
+
+(QUICK[qpCat]||[]).forEach(it=>{
 
       const d=document.createElement('div');
 
@@ -9565,7 +9611,29 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
 
   }
 
-  function openSettings(){
+  // ==================== 一键场景 + 聊天尾部刷新（2026-10-23 通知中心） ====================
+
+let SCEN=[]; let scenPicked=[];
+
+const SCEN_PRESETS=['锁车','解锁','闪灯','鸣笛','开空调','关空调','后备箱','关后备箱','开哨兵','关哨兵','开始充电','停止充电','座椅加热','方向盘加热'];
+
+async function loadScenarios(){ try{ const r=await fetch(API+'/api/scenarios',{headers:{'Authorization':'Bearer '+token}}); if(!r.ok) return; const d=await r.json(); if(d.ok){ SCEN=d.scenarios||[]; renderScenList(); renderQuick(); } }catch(e){} }
+
+function renderScenList(){ const box=document.getElementById('stt-scen-list'); if(!box) return; box.innerHTML=''; SCEN.forEach(function(s){ const row=document.createElement('div'); row.className='stt-row'; row.innerHTML='<div class="stt-row-label">'+dbEsc(s.name)+'<small>'+dbEsc((s.items||[]).join(' · '))+'</small></div><button class="scen-del" type="button">删除</button>'; row.querySelector('.scen-del').onclick=async function(){ if(!confirm('确定删除「'+s.name+'」？')) return; try{ const r=await fetch(API+'/api/scenarios',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({scenarios:SCEN.filter(function(x){return x.name!==s.name;})})}); const d=await r.json(); if(d.ok){ SCEN=d.scenarios||[]; renderScenList(); renderQuick(); } }catch(e){} }; box.appendChild(row); }); }
+
+function renderScenChips(){ const box=document.getElementById('stt-scen-chips'); box.innerHTML=''; SCEN_PRESETS.forEach(function(t){ const chip=document.createElement('button'); chip.type='button'; chip.className='scen-chip'+(scenPicked.indexOf(t)>=0?' on':''); chip.textContent=t; chip.onclick=function(){ const i=scenPicked.indexOf(t); if(i>=0) scenPicked.splice(i,1); else if(scenPicked.length<4) scenPicked.push(t); else return; document.getElementById('stt-scen-n').textContent=scenPicked.length; document.getElementById('stt-scen-picked').textContent=scenPicked.join(' → ')||'点标签挑 1~4 步'; renderScenChips(); }; box.appendChild(chip); }); }
+
+function openScenEditor(){ scenPicked=[]; document.getElementById('stt-scen-name').value=''; document.getElementById('stt-scen-n').textContent='0'; document.getElementById('stt-scen-picked').textContent='点标签挑 1~4 步'; renderScenChips(); document.getElementById('stt-scen-editor').classList.remove('hidden'); }
+
+async function saveScenario(){ const name=(document.getElementById('stt-scen-name').value||'').trim(); if(!name){ alert('先给场景起个名'); return; } if(!scenPicked.length){ alert('至少选 1 步'); return; } try{ const list=SCEN.filter(function(x){return x.name!==name;}).concat([{name:name, items:scenPicked.slice()}]); const r=await fetch(API+'/api/scenarios',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({scenarios:list})}); const d=await r.json(); if(d.ok){ SCEN=d.scenarios||list; document.getElementById('stt-scen-editor').classList.add('hidden'); renderScenList(); renderQuick(); } else alert(d.error||'保存失败'); }catch(e){ alert('网络错误'); } }
+
+function startChatTail(){ if(window.__chatTailTimer) return; window.__chatTailTimer=setInterval(async function(){ try{ if(document.visibilityState!=='visible'||busy||!token) return; const typing=document.querySelector('#chat .typing'); if(typing) return; const r=await fetch(API+'/api/chat/history',{headers:{'Authorization':'Bearer '+token}}); if(r.status!==200) return; const d=await r.json(); if(!d.ok) return; const len=(d.messages||[]).length; if(len<=(window.__chatLen||0)) return; const main=document.getElementById('chat'); const stick=main.scrollHeight-main.scrollTop-main.clientHeight<80; await loadChatHistory(); if(!stick && main) main.scrollTop=main.scrollHeight; }catch(e){} }, 30000); }
+
+function initChatExtras(){ loadScenarios(); startChatTail(); }
+
+(function(){ const a=document.getElementById('stt-scen-add'); if(a) a.onclick=openScenEditor; const x=document.getElementById('stt-scen-cancel'); if(x) x.onclick=function(){ document.getElementById('stt-scen-editor').classList.add('hidden'); }; const sv=document.getElementById('stt-scen-save'); if(sv) sv.onclick=saveScenario; })();
+
+function openSettings(){ initChatExtras();
 
     sttSync();
 
@@ -10582,7 +10650,7 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
 
   if(location.search.indexOf('demo')>=0){ loadDash().then(()=>enterDemo()); }
 
-  else if(token){ loadDash().then(()=>{ showApp(); loadAccount(); loadSettings(); enableNotifications(); pollNotifications(); notifyT=setInterval(pollNotifications,10000); startStateAuto(); checkPermGuideTrigger(); }); }
+  else if(token){ loadDash().then(()=>{ showApp(); loadAccount(); loadSettings(); enableNotifications(); pollNotifications(); initChatExtras(); notifyT=setInterval(pollNotifications,10000); startStateAuto(); checkPermGuideTrigger(); }); }
 
   else { showLogin(); }
 
