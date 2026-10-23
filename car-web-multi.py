@@ -916,6 +916,31 @@ def match_scenario(uid, text):
             return x
     return None
 
+
+def _run_scenario(uid, scen):
+    """场景整体执行（2026-10-23 用户定稿：只回一条整合消息）：逐条跑 run_runner，
+    每步取结果首行，汇总为「🎬 场景「名」执行完成（n/N 成功）+ 步骤清单」。"""
+    items = [str(x).strip() for x in (scen.get("items") or []) if str(x).strip()][:SCENARIO_STEPS_MAX]
+    lines = []
+    for it in items:
+        try:
+            out, err = run_runner(uid, it)
+        except Exception as e:
+            out, err = "", str(e)
+        if err:
+            lines.append("❌ " + it + "：" + str(err).splitlines()[0][:60])
+            continue
+        first = next((ln.strip() for ln in (out or "").splitlines() if ln.strip()), "")
+        if not first:
+            lines.append("❌ " + it + "：车辆没有响应")
+        else:
+            lines.append("✅ " + it + "：" + first.lstrip("✅ ").strip()[:60])
+    if not lines:
+        return "", "场景没有可执行步骤"
+    ok_n = sum(1 for ln in lines if ln.startswith("✅"))
+    head = f"🎬 场景「{(scen.get('name') or '').strip()}」执行完成（{ok_n}/{len(lines)} 成功）"
+    return head + "\n" + "\n".join(lines), None
+
 # ---------- 用户设置 ----------
 DEFAULT_SETTINGS = {
     "topic": "自动",        # 主题：浅色 | 深色 | 自动
@@ -1820,7 +1845,11 @@ def _process_user_queue(uid):
             threading.Thread(target=_wake_observer, args=(uid, stop_obs),
                              daemon=True, name=f"wake-obs-{uid}").start()
             try:
-                out, err = run_runner(uid, text)
+                scen = match_scenario(uid, text)
+                if scen:
+                    out, err = _run_scenario(uid, scen)   # 场景：整体执行，只回一条整合结果
+                else:
+                    out, err = run_runner(uid, text)
             finally:
                 stop_obs.set()
             with _async_lock:
@@ -3429,22 +3458,15 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
             return
         log_line("chat", f"{s['name']}({s['uid']}): {text}")
         uid = s["uid"]
-        # 一键场景：命中场景名 → 拆成多条指令依序入队（走现有异步队列，逐条回结果）
+        # 一键场景：命中场景名 → 整体入一个任务，执行完只回一条整合结果（_process_user_queue 分发）
         scen = match_scenario(uid, text)
         if scen:
             items = [str(x).strip() for x in (scen.get("items") or []) if str(x).strip()][:SCENARIO_STEPS_MAX]
             if items:
-                first_job = ""
-                for it in items:
-                    jid, _pos = _enqueue_job(uid, it, tasks=[it])
-                    if not first_job:
-                        first_job = jid
+                job_id, pos = _enqueue_job(uid, text, items)
                 append_chat(s["uid"], "me", text)
-                reply = f"🎬 场景「{scen.get('name')}」开始执行：{len(items)} 步依次进行，结果逐条出现"
-                append_chat(s["uid"], "car", reply)
-                self._json(200, {"ok": True, "mode": "async", "job": first_job,
-                                 "n": len(items), "tasks": items, "sleep": False,
-                                 "reply": reply, "pos": 1})
+                self._json(200, {"ok": True, "mode": "async", "job": job_id,
+                                 "n": len(items), "tasks": items, "sleep": False, "pos": pos})
                 return
         # 若当前用户正忙，不拒绝、不让用户稍等，直接收下进入排队队列！
         with _user_queues_lock:
