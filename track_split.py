@@ -125,3 +125,43 @@ def build_detail(mv, tid=None):
             d["regen_rate"] = round(kwh_neg / kwh_pos * 100, 1)
     d["power_series"] = [[p["ts"], p.get("pwr")] for p in mv if p.get("pwr") is not None]
     return d
+
+
+def repair_battery_power_detail(d):
+    """就地补齐旧结算文件缺失的能耗字段（有 power_series 即可重算）。
+
+    与 build_detail 口径一致：consumed_kwh=放电毛量，regen_kwh=回收，
+    wh_per_km=净消耗/里程；采样缺口>60s 按 60s 计。返回是否改写了 dict。
+    """
+    if not isinstance(d, dict):
+        return False
+    need = ("consumed_kwh" not in d) or ("wh_per_km" not in d) or ("regen_kwh" not in d)
+    if not need:
+        return False
+    series = d.get("power_series") or []
+    pwrs = [{"ts": p[0], "pwr": p[1]} for p in series
+            if isinstance(p, (list, tuple)) and len(p) >= 2 and p[1] is not None]
+    if len(pwrs) < 2:
+        return False
+    kwh_pos = kwh_neg = 0.0
+    for a, b in zip(pwrs, pwrs[1:]):
+        dt_h = min((b["ts"] - a["ts"]) / 3600000.0, 60 / 3600.0)
+        if a["pwr"] > 0:
+            kwh_pos += a["pwr"] * dt_h
+        else:
+            kwh_neg += -a["pwr"] * dt_h
+    changed = False
+    if "consumed_kwh" not in d:
+        d["consumed_kwh"] = round(kwh_pos, 2)
+        changed = True
+    if "regen_kwh" not in d:
+        d["regen_kwh"] = round(kwh_neg, 2)
+        changed = True
+    dist = d.get("distance_km")
+    if "wh_per_km" not in d and dist and dist > 0.3 and kwh_pos > 0.02:
+        d["wh_per_km"] = round(max(0.0, kwh_pos - kwh_neg) * 1000 / dist)
+        changed = True
+    if "regen_rate" not in d and kwh_pos > 0.02 and kwh_neg > 0.01:
+        d["regen_rate"] = round(kwh_neg / kwh_pos * 100, 1)
+        changed = True
+    return changed

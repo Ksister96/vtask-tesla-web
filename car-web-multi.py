@@ -42,6 +42,7 @@ import car_schedule_multi as schedule
 # 邮箱验证码登录（stdlib + SQLite；2026-10-17 起唯一登录方式，访问码/设备码下线）
 from email_auth import EmailAuthStore, AuthError
 from auth_http import EmailAuthEndpoints
+from trip_addresses import refresh_addresses as refresh_trip_addresses
 
 BASE = os.environ.get("MULTI_BASE", r"E:\tesla-fleet-multi")
 RUNNER = os.path.join(BASE, "user_runner.py")
@@ -60,6 +61,22 @@ MP_WX_SECRET = os.environ.get("MP_WX_SECRET", "")
 # 密码三种来源：环境变量 MONITOR_PASSWORD > 配置文件 monitor.json > 自动生成并写入 monitor.json
 MONITOR_FILE = os.path.join(BASE, "monitor.json")
 USER_NAMES_FILE = os.path.join(BASE, "user_names.json")
+
+
+def _write_json_atomic(path, data):
+    """Write mutable cache JSON without exposing a partially-written file to readers."""
+    tmp = "%s.tmp.%s.%s" % (path, os.getpid(), threading.get_ident())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
 
 def _claim_assets_by_vin(uid, vin):
     """2026-10-06 方案A：绑定/加载时自动认领同 VIN 老账号的资产（皮肤档取各车身最新、
@@ -2183,6 +2200,102 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             })
         self._json(200, {"ok": True, "days": days, "trips": out})
 
+    def _api_trip_list(self, query):
+        """行程列表（2026-10-24 长线存储版）：直接读 trip_details 结算文件（永久保留），
+        按 from/to（YYYY-MM-DD）过滤。days=0 表示全部。pts 取结算文件自带 route
+        （[lat,lon] 序列，转前端 [lon,lat]；无 route 的段回退空，前端显示占位）。"""
+        s = self._auth()
+        if not s:
+            self._json(401, {"ok": False, "error": "未登录"})
+            return
+        uid = s["uid"]
+        try:
+            days = max(0, min(3650, int(query.get("days", ["0"])[0])))
+        except Exception:
+            days = 0
+        # 方案 A（2026-10-24）：支持自然日期区间 from/to（YYYY-MM-DD，含端点）。
+        # 与 days 互斥：给了 from/to 按日历边界过滤（月档=某自然月，年档=某自然年）。
+        d_from = (query.get("from") or [""])[0] if isinstance(query.get("from"), list) else (query.get("from") or "")
+        d_to = (query.get("to") or [""])[0] if isinstance(query.get("to"), list) else (query.get("to") or "")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d_from):
+            d_from = ""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d_to):
+            d_to = ""
+        cutoff_ms = (time.time() - days * 86400) * 1000 if days else 0
+        ddir = os.path.join(user_dir(uid), "trip_details")
+        import track_split
+        items = []
+        address_repairs = 0
+        if os.path.isdir(ddir):
+            for fn in os.listdir(ddir):
+                if not fn.endswith(".json") or not re.fullmatch(r"[0-9]{8}-[0-9]{6}\.json", fn):
+                    continue
+                detail_path = os.path.join(ddir, fn)
+                try:
+                    d = json.load(open(detail_path, encoding="utf-8"))
+                except Exception:
+                    continue
+                if track_split.repair_battery_power_detail(d):
+                    try:
+                        _write_json_atomic(detail_path, d)
+                    except OSError as error:
+                        log_line("trip", "行程能耗回写失败 %s: %s" % (fn, error))
+                tid = fn[:-5]
+                try:
+                    datetime.strptime(tid, "%Y%m%d-%H%M%S")
+                except ValueError:
+                    continue
+                t0 = datetime.strptime(tid, "%Y%m%d-%H%M%S").timestamp() * 1000
+                if t0 < cutoff_ms:
+                    continue
+                date_s = tid[:4] + "-" + tid[4:6] + "-" + tid[6:8]
+                if d_from and date_s < d_from:
+                    continue
+                if d_to and date_s > d_to:
+                    continue
+                # 网页 /api/trips 会按坐标即时反查；长线列表也须修复历史占位地址，
+                # 否则同一趟行程会出现“网页正常、小程序未知位置”。成功后原子回写一次。
+                # 单次请求最多修8条，避免大量旧坏缓存把列表请求拖成超长任务；后续打开继续补齐。
+                if address_repairs < 8 and refresh_trip_addresses(d, regeo_name):
+                    address_repairs += 1
+                    try:
+                        _write_json_atomic(detail_path, d)
+                    except OSError as error:
+                        log_line("trip", "行程地址回写失败 %s: %s" % (fn, error))
+                km = d.get("distance_km") or 0
+                if not km:
+                    continue
+                route = d.get("route") or []
+                pts = [["%.6f" % float(q[1]), "%.6f" % float(q[0])] for q in route
+                       if isinstance(q, (list, tuple)) and len(q) >= 2] if route else []
+                items.append({"detail_id": tid,
+                              "date": date_s,
+                              "time": tid[9:11] + ":" + tid[11:13],
+                              "km": round(km, 1), "min": d.get("duration_min") or 0,
+                              "from": d.get("start_addr") or "未知位置",
+                              "to": d.get("end_addr") or "未知位置",
+                              "pts": track_split.downsample(pts, 60) if pts else []})
+        items.sort(key=lambda x: x["detail_id"], reverse=True)
+        # 聚合（2026-10-24 第五屏三格 + 查行程意图）：本月自然月口径
+        month_prefix = time.strftime("%Y-%m")
+        agg = {"trips": 0, "km": 0.0, "kwh": 0.0}
+        for fn in os.listdir(ddir) if os.path.isdir(ddir) else []:
+            if not fn.endswith(".json") or not re.fullmatch(r"[0-9]{8}-[0-9]{6}\.json", fn):
+                continue
+            if not fn.startswith(month_prefix.replace("-", "")):
+                continue
+            try:
+                d = json.load(open(os.path.join(ddir, fn), encoding="utf-8"))
+            except Exception:
+                continue
+            if d.get("distance_km"):
+                agg["trips"] += 1
+                agg["km"] += d.get("distance_km") or 0
+                agg["kwh"] += d.get("consumed_kwh") or 0
+        summary = {"trips": agg["trips"], "km": round(agg["km"], 1), "kwh": round(agg["kwh"], 2),
+                   "fee": round(agg["kwh"] * 1.0, 2), "month": month_prefix}
+        self._json(200, {"ok": True, "days": days, "trips": items, "summary": summary})
+
     def _api_trip_detail(self, query):
         """单个行程详情 JSON（P 档结算数据：里程/用时/车速/电量/续航/温度/趋势）。"""
         s = self._auth()
@@ -2585,6 +2698,9 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             return
         if path == "/api/trip_map":
             self._api_trip_map(query)
+            return
+        if path == "/api/trip_list":
+            self._api_trip_list(query)
             return
         if path == "/test-trip.html":
             self._serve_file("test-trip.html", "text/html; charset=utf-8")
