@@ -2678,6 +2678,9 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         if path == "/api/monitor/events":
             self._api_monitor_events()
             return
+        if path == "/api/monitor/user_ops":
+            self._api_monitor_user_ops()
+            return
         if path == "/monitor":
             self._api_monitor_page()
             return
@@ -4116,6 +4119,41 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
         events.sort(key=keyf, reverse=True)
         danger = any(any(kw in e["line"] for kw in self.DANGER_KW) for e in events[:5])
         self._json(200, {"ok": True, "events": events[:MONITOR_EVENTS_MAX], "now": time.time()})
+
+    def _api_monitor_user_ops(self):
+        """单用户操作历史：读 users/<uid>/ops.log，供监控大屏侧栏展示。"""
+        q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())
+        if q.get("pw") != MONITOR_KEY:
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        uid = (q.get("uid") or "").strip()
+        if (not uid
+                or uid in (".", "..")
+                or "/" in uid
+                or "\\" in uid
+                or os.sep in uid
+                or ".." in uid):
+            self._json(400, {"ok": False, "error": "invalid_uid"})
+            return
+        ud = os.path.join(USERS_DIR, uid)
+        try:
+            real_users = os.path.realpath(USERS_DIR)
+            real_ud = os.path.realpath(ud)
+        except Exception:
+            self._json(400, {"ok": False, "error": "invalid_uid"})
+            return
+        if not real_ud.startswith(real_users + os.sep) or not os.path.isdir(real_ud):
+            self._json(404, {"ok": False, "error": "user_not_found"})
+            return
+        # ops.log 行序是追加写入（旧→新）；侧栏要最新在前，故倒序返回
+        ops = list(reversed(self._monitor_read_ops(uid, 500)))
+        names = _load_user_names()
+        self._json(200, {
+            "ok": True,
+            "uid": uid,
+            "user_name": names.get(uid, ""),
+            "ops": ops,
+        })
 
     def _api_monitor_page(self):
         q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())
