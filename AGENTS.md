@@ -14,6 +14,21 @@
 
 2026-11-03：将 PR#2（monitor `user_ops`）相关变更以 GitHub main 的 `car-web-multi.py` **整文件覆盖**上生产，导致生产独有、尚未入库的 `/api/trip_list`（小程序行程列表）被抹掉；现网已从备份 `car-web-multi.py.bak.20261103014912` 外科手术式恢复。本仓库须把 `trip_list` 等现网能力对齐进 GitHub，且以后禁止再整文件覆盖。
 
+同日另起事故：批量解绑约 32 个「黑珍珠」账号，以及 `/api/monitor/cleanup` 清理废账号时，误清了主人现网绑定。主人身份：`z13162002608@hotmail.com` / uid `E2299e37a4acc93ea44ca671e`。代码层已加硬保护（见下节）。
+
+## 解绑 / 清理硬保护（代码门禁）
+
+`car-web-multi.py` 中 `PROTECTED_UNBIND_UIDS`（可扩展）：
+
+- `E2299e37a4acc93ea44ca671e`（主人 hotmail）
+- `demo01`（演示账号，必须保留）
+
+规则：
+
+1. **二次确认**：`POST /api/unbind`、`POST /api/monitor/cleanup`、`POST /api/monitor/unbind` 必须带 `confirm=true` / `confirm=UNBIND`（cleanup 亦接受 `CLEANUP`）或键入目标 uid；否则 **4xx**，不改动任何文件。
+2. **白名单硬拒绝**：命中 `PROTECTED_UNBIND_UIDS` 时即使带 confirm 也 **403**（批量解绑则该 uid 条目 `ok: false`）。**无超级旁路**；要从名单拿掉须改代码 + 周哥点头。
+3. 保护范围：禁止删其 `tokens.json` / `account.json` / `schedules.json` / `notifications.json`、用户目录（cleanup `rmtree`）、以及运维解绑时的 `pair_state` 条目。
+
 ## 改代码约定（摘要）
 
 - 保持变更窄、可审：不要顺手大重构。

@@ -5562,7 +5562,7 @@ var __locNode = null;   // 定位标签常驻节点：重建后挂回，不拆�
 
     try{
 
-      const r=await fetch(API+'/api/unbind',{method:'POST',headers:{'Authorization':'Bearer '+token}});
+      const r=await fetch(API+'/api/unbind',{method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({confirm:'UNBIND'})});
 
       if(r.status===401){ closeUnbind(); showLogin(); return; }
 
