@@ -16,7 +16,8 @@ h1{font-size:19px;margin:0}
 .stat span{color:#8b949e;font-size:12px}
 .stat.warn b{color:#ffa198}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin-bottom:18px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px;transition:border-color .2s}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px;transition:border-color .2s;cursor:pointer}
+.card:hover{border-color:#58a6ff88}
 .card.unpaired{border-color:#f8514988;background:#da363311}
 .tag-pair{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:600}
 .tag-pair.ready{background:#23863633;color:#7ee787;border:1px solid #23863666}
@@ -51,6 +52,21 @@ h1{font-size:19px;margin:0}
 .deadbox{background:#161b22;border:1px dashed #6e7681;border-radius:12px;padding:12px 14px;margin-bottom:16px}
 .deadbox h2{font-size:13px;margin:0 0 8px;color:#ffa198}
 .deadbox .uids{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#8b949e;word-break:break-all;margin-bottom:10px}
+.hist-aff{display:inline-block;margin-top:8px;font-size:12px;color:#58a6ff;opacity:.85}
+.hist-aff:hover{opacity:1;text-decoration:underline}
+.drawer-backdrop{position:fixed;inset:0;background:rgba(1,4,9,.55);z-index:40;opacity:0;pointer-events:none;transition:opacity .2s}
+.drawer-backdrop.open{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;right:0;height:100%;width:min(420px,92vw);background:#161b22;border-left:1px solid #30363d;z-index:50;transform:translateX(100%);transition:transform .22s ease;display:flex;flex-direction:column;box-shadow:-8px 0 24px rgba(0,0,0,.35)}
+.drawer.open{transform:translateX(0)}
+.drawer-hd{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 16px 12px;border-bottom:1px solid #21262d;flex:0 0 auto}
+.drawer-hd .meta{min-width:0}
+.drawer-hd .title{font-size:16px;font-weight:700;word-break:break-all;margin:0 0 4px}
+.drawer-hd .sub{color:#8b949e;font-size:12px;word-break:break-all;line-height:1.45}
+.drawer-close{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:8px;width:32px;height:32px;cursor:pointer;font-size:18px;line-height:1;flex:0 0 auto}
+.drawer-close:hover{background:#30363d}
+.drawer-bd{flex:1;overflow:auto;padding:12px 14px 24px}
+.drawer-bd .ev{white-space:pre-wrap;word-break:break-word}
+.drawer-bd .ev .v{display:none}
 </style>
 </head>
 <body>
@@ -78,7 +94,19 @@ h1{font-size:19px;margin:0}
   <div id="evs"><div class="empty">加载中…</div></div>
 </div>
 
-<div id="foot">每 3 秒自动刷新 · <span style="color:#f85149">■ 危险操作标红</span> · 口令校验：/monitor?pw=…</div>
+<div id="foot">每 3 秒自动刷新 · <span style="color:#f85149">■ 危险操作标红</span> · 口令校验：/monitor?pw=… · 点击用户卡片查看操作历史</div>
+
+<div class="drawer-backdrop" id="drawer-backdrop" onclick="closeUserOps()"></div>
+<aside class="drawer" id="user-ops-drawer" aria-hidden="true">
+  <div class="drawer-hd">
+    <div class="meta">
+      <div class="title" id="drawer-title">—</div>
+      <div class="sub" id="drawer-sub"></div>
+    </div>
+    <button type="button" class="drawer-close" onclick="closeUserOps()" title="关闭" aria-label="关闭">×</button>
+  </div>
+  <div class="drawer-bd" id="drawer-ops"><div class="empty">加载中…</div></div>
+</aside>
 
 <script>
 const PW = "__PW__";
@@ -137,10 +165,10 @@ function renderGrid(users){
     var email = u.email ? '<div class="c-email">\u2709 '+esc(u.email)+'</div>' : '';
     var lastAct = u.last_chat || u.last_ts;
     var actLine = lastAct ? '<div class="opshint">最后活跃：'+esc(fmtIso(lastAct))+' · 消息 '+esc(u.msgs||0)+' 条</div>' : '';
-    var msgBox = '<div class="msgrow"><input type="text" placeholder="发消息到 TA 的小程序…（回车发送）" data-uid="'+esc(u.uid)
+    var msgBox = '<div class="msgrow"><input type="text" class="msg-in" placeholder="发消息到 TA 的小程序…（回车发送）" data-uid="'+esc(u.uid)
       +'" onkeydown="if(event.key===\'Enter\'){sendMsg(this.getAttribute(\'data-uid\'),this.value,this);}">'
-      +'<button onclick="var inp=this.previousElementSibling;sendMsg(inp.getAttribute(\'data-uid\'),inp.value,inp);">发送</button></div>';
-    return '<div class="'+cardCls+'" data-uid="'+esc(u.uid)+'">'
+      +'<button type="button" class="msg-send" onclick="var inp=this.previousElementSibling;sendMsg(inp.getAttribute(\'data-uid\'),inp.value,inp);">发送</button></div>';
+    return '<div class="'+cardCls+'" data-uid="'+esc(u.uid)+'" role="button" tabindex="0" title="点击查看操作历史">'
       +'<div class="c-uid">'+dot+'<span>'+esc(u.uid)+'</span></div>'
       +'<div class="c-nm">'+renderName(u)+'</div>'
       + email
@@ -151,6 +179,7 @@ function renderGrid(users){
       + msgBox
       +'<div class="opshint" title="'+esc(u.last_op||'')+'">最后操作：'+esc(u.last_op||'（无）')+'</div>'
       + actLine
+      +'<div class="hist-aff" data-open-ops="1">查看历史 →</div>'
       +'</div>';
   }).join("");
 }
@@ -221,6 +250,10 @@ function loadAll(){
       deadUidCache = d.dead_uids || [];
       var dn=document.getElementById("deadn");
       if(dn)dn.textContent = deadUidCache.length ? "（"+deadUidCache.length+" 个）" : "";
+      var map={};
+      (d.users||[]).forEach(function(u){map[u.uid]=u;});
+      usersByUid=map;
+      if(drawerUid)fillDrawerHeader(drawerUid, (usersByUid[drawerUid]||{}).name||"");
       var sig=JSON.stringify(d.users||[]);
       if(sig!==lastGridSig){ lastGridSig=sig; renderGrid(d.users); }
     })
@@ -234,9 +267,80 @@ function loadAll(){
     .catch(function(){});
 }
 var lastGridSig=null,lastEvsSig=null;
+var usersByUid={};
+var drawerUid=null;
+
+function closeUserOps(){
+  drawerUid=null;
+  var d=document.getElementById("user-ops-drawer");
+  var b=document.getElementById("drawer-backdrop");
+  if(d){d.classList.remove("open");d.setAttribute("aria-hidden","true");}
+  if(b)b.classList.remove("open");
+}
+function renderDrawerOps(ops){
+  var el=document.getElementById("drawer-ops");
+  if(!el)return;
+  if(!ops || !ops.length){el.innerHTML='<div class="empty">暂无操作记录（无 ops.log 或为空）</div>';return;}
+  el.innerHTML=ops.map(function(line){
+    var dng=isDanger(line);
+    var cls=dng?'ev danger':'ev normal';
+    return '<div class="'+cls+'">'+esc(line)+(dng?' \u26a0\ufe0f':'')+'</div>';
+  }).join("");
+}
+function fillDrawerHeader(uid, apiName){
+  var u=usersByUid[uid]||{};
+  var title=document.getElementById("drawer-title");
+  var sub=document.getElementById("drawer-sub");
+  var name=(apiName!=null && apiName!=="")?apiName:(u.name||"");
+  if(title)title.textContent=name||uid;
+  var parts=[];
+  if(name && name!==uid)parts.push("uid: "+uid);
+  if(u.car||u.vin)parts.push((u.car||"未绑车")+(u.vin?" · "+u.vin:""));
+  if(u.email)parts.push(u.email);
+  if(sub)sub.textContent=parts.join(" · ")||("uid: "+uid);
+}
+function openUserOps(uid){
+  if(!uid)return;
+  drawerUid=uid;
+  fillDrawerHeader(uid, (usersByUid[uid]||{}).name||"");
+  var opsEl=document.getElementById("drawer-ops");
+  if(opsEl)opsEl.innerHTML='<div class="empty">加载中…</div>';
+  var d=document.getElementById("user-ops-drawer");
+  var b=document.getElementById("drawer-backdrop");
+  if(d){d.classList.add("open");d.setAttribute("aria-hidden","false");}
+  if(b)b.classList.add("open");
+  fetch("/api/monitor/user_ops?pw="+encodeURIComponent(PW)+"&uid="+encodeURIComponent(uid))
+    .then(function(r){return r.json();})
+    .then(function(resp){
+      if(drawerUid!==uid)return;
+      if(!resp||!resp.ok){
+        if(opsEl)opsEl.innerHTML='<div class="empty">加载失败'+(resp&&resp.error?("："+esc(resp.error)):"")+'</div>';
+        return;
+      }
+      fillDrawerHeader(uid, resp.user_name||"");
+      renderDrawerOps(resp.ops||[]);
+    })
+    .catch(function(){
+      if(drawerUid!==uid)return;
+      if(opsEl)opsEl.innerHTML='<div class="empty">加载失败</div>';
+    });
+}
+function isCardInteractiveTarget(t){
+  if(!t||!t.closest)return false;
+  if(t.closest("button")||t.closest("input")||t.closest("textarea")||t.closest("a")||t.closest("label"))return true;
+  if(t.closest(".msgrow")||t.closest(".nm-edit")||t.closest(".c-nm"))return true;
+  return false;
+}
+
 document.addEventListener("click",function(ev){
   var t=ev.target;
-  if(t && t.classList && t.classList.contains("nm-edit")){openEdit(t.getAttribute("data-uid"));}
+  if(t && t.classList && t.classList.contains("nm-edit")){openEdit(t.getAttribute("data-uid"));return;}
+  if(isCardInteractiveTarget(t))return;
+  var card=t && t.closest ? t.closest(".card[data-uid]") : null;
+  if(card){openUserOps(card.getAttribute("data-uid"));}
+});
+document.addEventListener("keydown",function(ev){
+  if(ev.key==="Escape" && drawerUid){closeUserOps();}
 });
 
 function tick(){
