@@ -2741,6 +2741,8 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._api_monitor_send()
         elif path == "/api/monitor/cleanup":
             self._api_monitor_cleanup()
+        elif path == "/api/monitor/unbind":
+            self._api_monitor_unbind()
         elif path == "/api/mp/login":
             self._api_mp_login()
         else:
@@ -4095,6 +4097,72 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
             shutil.rmtree(ud, ignore_errors=True)
             removed.append(uid)
         self._json(200, {"ok": True, "removed": removed})
+
+    def _api_monitor_unbind(self):
+        """运维解绑：MONITOR_KEY 鉴权，按 uid/uids 执行与 /api/unbind 相同的文件删除。"""
+        q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())
+        body = self._parse_json() or {}
+        pw = q.get("pw") or body.get("pw")
+        if pw != MONITOR_KEY:
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        uids = []
+        one = str(body.get("uid") or "").strip()
+        if one:
+            uids.append(one)
+        for u in (body.get("uids") or []):
+            su = str(u or "").strip()
+            if su and su not in uids:
+                uids.append(su)
+        if not uids:
+            self._json(400, {"ok": False, "error": "uid_required"})
+            return
+        results = []
+        for uid in uids:
+            if uid == "vehicles":
+                results.append({"uid": uid, "removed": [], "ok": False,
+                                "error": "refused: shared vehicles cache"})
+                log_line("monitor_unbind", "refused uid=vehicles")
+                continue
+            ud = user_dir(uid)
+            if not os.path.isdir(ud):
+                results.append({"uid": uid, "removed": [], "ok": False, "error": "not a directory"})
+                continue
+            removed = []
+            err = None
+            for fn in ("tokens.json", "account.json", "schedules.json", "notifications.json"):
+                fp = os.path.join(ud, fn)
+                try:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                        removed.append(fn)
+                except Exception as e:
+                    log_line("monitor_unbind", f"删除 {uid}/{fn} 失败: {e}")
+                    err = str(e)
+            # pair_state.json 按 uid 分键；只 pop 本 uid，不动其他用户
+            try:
+                p = _pair_state_path()
+                if os.path.exists(p):
+                    with open(p, "r", encoding="utf-8") as f:
+                        d = json.load(f) or {}
+                    if isinstance(d, dict) and uid in d:
+                        d.pop(uid, None)
+                        tmp = p + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(d, f, ensure_ascii=False, indent=2)
+                        os.replace(tmp, p)
+                        removed.append("pair_state")
+            except Exception as e:
+                log_line("monitor_unbind", f"清除 pair_state[{uid}] 失败: {e}")
+                if err is None:
+                    err = "pair_state: %s" % e
+            item = {"uid": uid, "removed": removed, "ok": err is None}
+            if err is not None:
+                item["error"] = err
+            results.append(item)
+            log_line("monitor_unbind",
+                     f"{uid} 解绑 ok={err is None} removed={','.join(removed) or '无'}")
+        self._json(200, {"ok": True, "results": results})
 
     def _api_monitor_events(self):
         q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())
