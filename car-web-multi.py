@@ -54,6 +54,8 @@ AMAP_KEY_FILE = os.path.join(BASE, "amap_key.txt")
 AMAP_MAP_SEM = threading.BoundedSemaphore(1)
 # 小程序（微信）凭据：环境变量注入；两者齐备走真 code2session，缺省为 mock 模式
 MP_WX_APPID = os.environ.get("MP_WX_APPID", "")
+_WXMSG_TOKEN = {"tok": "", "ts": 0}   # 订阅消息 access_token 进程级缓存
+WXMSG_TRIP_TMPL = "zErBRh7BVm9q7SEJe8FpINXm0qg8Af5oDNHCsMrSDxM"   # 行程通知订阅模板
 MP_WX_SECRET = os.environ.get("MP_WX_SECRET", "")
 
 # 监控大屏：手机可访问的实时用户操作面板
@@ -2744,7 +2746,9 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._api_monitor_send()
         elif path == "/api/monitor/cleanup":
             self._api_monitor_cleanup()
-        elif path == "/api/mp/login":
+        elif path == "/internal/wxmsg":
+            self._internal_wxmsg()
+        elif path in ("/api/mp/login", "/api/mp_login"):
             self._api_mp_login()
         else:
             self._json(404, {"ok": False, "error": "not found"})
@@ -2779,18 +2783,93 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         except Exception:
             return ""
 
+    # ---- 订阅消息（微信小程序）----
+    def _wxmsg_access_token(self):
+        """小程序全局 access_token，7200s 有效，进程内缓存 7000s。失败返回 None。"""
+        now = time.time()
+        if _WXMSG_TOKEN["tok"] and now - _WXMSG_TOKEN["ts"] < 7000:
+            return _WXMSG_TOKEN["tok"]
+        if not (MP_WX_APPID and MP_WX_SECRET):
+            return None
+        try:
+            u = ("https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential"
+                 "&appid=%s&secret=%s" % (MP_WX_APPID, MP_WX_SECRET))
+            with urllib.request.urlopen(u, timeout=8) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            tok = d.get("access_token")
+            if tok:
+                _WXMSG_TOKEN["tok"] = tok; _WXMSG_TOKEN["ts"] = now
+                return tok
+            log_line("wxmsg", f"token 失败: {d}")
+        except Exception as e:
+            log_line("wxmsg", f"token 异常: {e}")
+        return None
+
+    def send_subscribe_msg(self, openid, template_id, data, page=None):
+        """发一条订阅消息。data 结构：{"key1": {"value": "v1"}, ...}。成功 True。"""
+        tok = self._wxmsg_access_token()
+        if not tok:
+            return False
+        payload = {"touser": openid, "template_id": template_id, "data": data}
+        if page:
+            payload["page"] = page
+        try:
+            req = urllib.request.Request(
+                "https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token=" + tok,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            if d.get("errcode") == 0:
+                return True
+            # 43101=用户未订阅/已拒收：静默；其他记日志
+            log_line("wxmsg", f"发送失败 openid={openid[:8]}… err={d.get('errcode')} {d.get('errmsg')}")
+            return False
+        except Exception as e:
+            log_line("wxmsg", f"发送异常: {e}")
+            return False
+
+    def _internal_wxmsg(self):
+        """内部接口：track_watcher 行程完成推送订阅消息（仅 127.0.0.1）。
+        body: {"uid": "...", "title": "行程完成", "value": "12.3 km · 25 分钟", "page": "pages/home/home"}"""
+        if not self.client_address or not str(self.client_address[0]).startswith("127."):
+            self._json(403, {"ok": False})
+            return
+        data = self._parse_json() or {}
+        uid = str(data.get("uid") or "")
+        title = str(data.get("title") or "通知")
+        value = str(data.get("value") or "")
+        page = data.get("page") or "pages/home/home"
+        if not uid:
+            self._json(400, {"ok": False, "error": "missing uid"})
+            return
+        try:
+            codes = load_codes()
+            openid = (codes.get(uid) or {}).get("openid") or ""
+        except Exception:
+            openid = ""
+        if not openid:
+            self._json(200, {"ok": True, "sent": False, "reason": "no openid"})
+            return
+        now_s = datetime.now().strftime("%m月%d日 %H:%M")
+        sent = self.send_subscribe_msg(openid, WXMSG_TRIP_TMPL, {
+            "thing1": {"value": title[:20]},
+            "thing2": {"value": value[:20]},
+            "time3": {"value": now_s},
+        }, page)
+        self._json(200, {"ok": True, "sent": bool(sent)})
+
     # ---- 小程序登录（骨架，2026-10-04 预埋；凭据走环境变量 MP_WX_APPID/MP_WX_SECRET）----
     def _api_mp_login(self):
-        """wx.login 的 code 换 openid 并落到 uid。未配置 AppID/Secret 时为 mock 模式：
-        用 code 派生伪 openid，供小程序壳无凭据联调；配置后自动走 code2session 真换。
-        uid 以 openid 哈希生成，档案落 friends-codes.json（与 H5 自助注册同构），
-        openid 本身不回传客户端。"""
+        """wx.login 的 code 换 openid。优先用会话 token 绑到已登录邮箱 uid（供行程订阅推送）；
+        无有效会话时回落为 MP* uid（兼容旧 /api/mp/login）。
+        未配置 AppID/Secret 时为 mock 模式。openid 本身不回传客户端。"""
         ip = self.client_address[0] if self.client_address else "?"
         if not self._rate_ok("mplogin:" + ip):
             self._json(429, {"ok": False, "error": "尝试过于频繁，请稍后再试"})
             return
-        data = self._parse_json()
-        if not data or not str(data.get("code", "")).strip():
+        data = self._parse_json() or {}
+        if not str(data.get("code", "")).strip():
             self._json(400, {"ok": False, "error": "缺少 code"})
             return
         code = str(data["code"]).strip()
@@ -2813,12 +2892,35 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         if not openid:
             self._json(402, {"ok": False, "error": "微信登录失败，请重试"})
             return
-        uid = "MP" + hashlib.sha1(openid.encode("utf-8")).hexdigest()[:10].upper()
+        # 会话绑定：body.token 或 Authorization Bearer → 邮箱 uid
+        tok = str(data.get("token") or "").strip()
+        if not tok:
+            h = self.headers.get("Authorization", "")
+            if h.startswith("Bearer "):
+                tok = h[7:].strip()
+        sess = check_session(tok) if tok else None
         codes = load_codes()
+        if sess and sess.get("uid"):
+            uid = sess["uid"]
+            if uid not in codes:
+                codes[uid] = {"name": sess.get("name") or ("用户 " + uid[-4:]), "enabled": True}
+            codes[uid]["openid"] = openid
+            save_codes(codes)
+            log_line("mplogin", f"绑定 openid→uid={uid} mock={is_mock}")
+            self._json(200, {"ok": True, "uid": uid, "mock": is_mock, "bound": True})
+            return
+        # 无会话：旧路径，按 openid 派生 MP* uid
+        uid = "MP" + hashlib.sha1(openid.encode("utf-8")).hexdigest()[:10].upper()
         if uid not in codes:
             codes[uid] = {"name": "小程序用户 " + uid[-4:], "enabled": True}
             save_codes(codes)
             log_line("mplogin", f"新建小程序用户档案: {uid}")
+        if not is_mock:
+            try:
+                codes[uid]["openid"] = openid
+                save_codes(codes)
+            except Exception:
+                pass
         log_line("mplogin", f"小程序登录: {uid} mock={is_mock}")
         self._json(200, {"ok": True, "uid": uid, "mock": is_mock})
 

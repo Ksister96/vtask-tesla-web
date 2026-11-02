@@ -339,6 +339,16 @@ def settle_trip(uid, seg):
         sys_msg(uid, f"🚗 行程完成：{_dist} km · {int(_dur_s // 60)} 分钟{tail}")
     except Exception:
         pass
+    # 订阅消息：用户授权过则微信通知，失败静默（不打断 settle）
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8794/internal/wxmsg",
+            data=json.dumps({"uid": uid, "title": "行程完成",
+                             "value": "%.1f km · %d 分钟" % (_dist, _dur_s / 60)}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception:
+        pass
     log("%s 行程结算 %s %.1fkm %d分钟" % (uid, detail["id"], _dist, _dur_s / 60))
 
 
