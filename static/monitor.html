@@ -221,12 +221,22 @@ function sendMsg(uid,text,inp){
 function cleanupDead(){
   if(!deadUidCache.length){alert("当前没有废账号");return;}
   if(!confirm("确认删除 "+deadUidCache.length+" 个废账号目录？（无绑定、无消息的探测残留，不可恢复）"))return;
-  var body=JSON.stringify({pw:PW});
+  var typed=prompt("二次确认：请输入 CLEANUP 继续（受保护账号即使确认也不会被删）");
+  if(typed!=="CLEANUP"){alert("已取消（未输入 CLEANUP）");return;}
+  var body=JSON.stringify({pw:PW,confirm:"CLEANUP"});
   fetch("/api/monitor/cleanup?pw="+encodeURIComponent(PW),{method:"POST",headers:{"Content-Type":"application/json"},body:body})
-    .then(function(r){return r.json();})
-    .then(function(d){
+    .then(function(r){return r.json().then(function(d){return {status:r.status,d:d};});})
+    .then(function(x){
+      var d=x.d||{};
       var m=document.getElementById("cln-msg");
-      if(m)m.textContent = d && d.ok ? ("已清理 "+(d.removed||[]).length+" 个") : "清理失败";
+      if(m){
+        if(d.ok){
+          var sk=(d.skipped_protected||[]).length;
+          m.textContent="已清理 "+(d.removed||[]).length+" 个"+(sk?"（跳过保护 "+sk+"）":"");
+        }else{
+          m.textContent=d.error||("清理失败 HTTP "+x.status);
+        }
+      }
       loadAll();
     })
     .catch(function(){alert("清理失败");});

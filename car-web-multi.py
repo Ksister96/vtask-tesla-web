@@ -245,6 +245,57 @@ def _save_user_names(names):
         return False
 
 MONITOR_EVENTS_MAX = 80
+
+# 解绑/清理硬保护名单（2026-11-03 事故后）：即使带 confirm 也不允许销毁这些 uid 的
+# tokens/account/schedules/notifications/用户目录/identities 条目。
+# 无超级旁路；要从名单移除须改代码 + 周哥点头。
+PROTECTED_UNBIND_UIDS = frozenset({
+    "E2299e37a4acc93ea44ca671e",  # 主人 hotmail（z13162002608@hotmail.com）
+    "demo01",                     # 演示账号，必须保留
+})
+
+_CONFIRM_TRUE = frozenset({"true", "1", "yes", "y", "on"})
+_CONFIRM_TOKENS = frozenset({"UNBIND", "CLEANUP"})
+
+
+def is_protected_unbind_uid(uid):
+    return str(uid or "").strip() in PROTECTED_UNBIND_UIDS
+
+
+def destructive_confirm_ok(confirm, uid=None):
+    """解绑/清理二次确认：confirm=true / UNBIND / CLEANUP，或键入目标 uid。"""
+    if confirm is True:
+        return True
+    if confirm is False or confirm is None:
+        return False
+    s = str(confirm).strip()
+    if not s:
+        return False
+    if s.lower() in _CONFIRM_TRUE:
+        return True
+    if s.upper() in _CONFIRM_TOKENS:
+        return True
+    if uid is not None and s == str(uid).strip():
+        return True
+    return False
+
+
+def _unbind_user_files(uid):
+    """删除 users/<uid> 下绑定相关文件。调用方须已通过 confirm + 白名单门禁。"""
+    removed = []
+    err = None
+    for fn in ("tokens.json", "account.json", "schedules.json", "notifications.json"):
+        fp = os.path.join(user_dir(uid), fn)
+        try:
+            if os.path.exists(fp):
+                os.remove(fp)
+                removed.append(fn)
+        except Exception as e:
+            log_line("unbind", f"删除 {uid}/{fn} 失败: {e}")
+            err = str(e)
+    return removed, err
+
+
 # 默认仅本机回环；可用环境变量 CAR_HOST 临时放开（如 CAR_HOST=0.0.0.0 供局域网/手机联调）
 import os as _os
 HOST = _os.environ.get("CAR_HOST", "127.0.0.1")
@@ -2860,6 +2911,8 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._api_monitor_send()
         elif path == "/api/monitor/cleanup":
             self._api_monitor_cleanup()
+        elif path == "/api/monitor/unbind":
+            self._api_monitor_unbind()
         elif path == "/api/mp/login":
             self._api_mp_login()
         else:
@@ -3764,21 +3817,33 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
             self._json(500, {"ok": False, "error": str(e)})
 
     def _api_unbind(self):
-        """一键解绑：删除该账号持有的特斯拉授权与绑定/定时数据（收回钥匙）。"""
+        """一键解绑：删除该账号持有的特斯拉授权与绑定/定时数据（收回钥匙）。
+        须二次确认 confirm；PROTECTED_UNBIND_UIDS 即使 confirm 也 403。"""
         s = self._auth()
         if not s:
             self._json(401, {"ok": False, "error": "未登录或会话过期"})
             return
         uid = s["uid"]
-        removed = []
-        for fn in ("tokens.json", "account.json", "schedules.json", "notifications.json"):
-            fp = os.path.join(user_dir(uid), fn)
-            try:
-                if os.path.exists(fp):
-                    os.remove(fp)
-                    removed.append(fn)
-            except Exception as e:
-                log_line("unbind", f"删除 {fn} 失败: {e}")
+        body = self._parse_json() or {}
+        q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(
+            self.path.split("?", 1)[1] if "?" in self.path else "").items())
+        confirm = body.get("confirm", q.get("confirm"))
+        if not destructive_confirm_ok(confirm, uid=uid):
+            self._json(400, {
+                "ok": False,
+                "error": "需要二次确认：请传 confirm=true 或 confirm=UNBIND / 目标uid"
+                         "（Need second confirmation: pass confirm=true, confirm=UNBIND, or the target uid）",
+            })
+            return
+        if is_protected_unbind_uid(uid):
+            log_line("unbind", f"拒绝销毁受保护账号 {uid}")
+            self._json(403, {
+                "ok": False,
+                "error": "受保护账号禁止解绑/清理（Protected uid；移除须改代码白名单 + 周哥点头）",
+                "uid": uid,
+            })
+            return
+        removed, _err = _unbind_user_files(uid)
         log_line("unbind", f"{s['name']}({uid}) 一键解绑，删除: {','.join(removed) or '无'}")
         self._json(200, {"ok": True, "removed": removed})
 
@@ -4195,25 +4260,125 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
         self._json(200, {"ok": True})
 
     def _api_monitor_cleanup(self):
-        """清理废账号目录：无 account.json 且从未有消息的纯探测残留。"""
+        """清理废账号目录：无 account.json 且从未有消息的纯探测残留。
+        须二次确认 confirm；PROTECTED_UNBIND_UIDS 永不删除（即使 confirm）。"""
         q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())
-        if q.get("pw") != MONITOR_KEY:
+        body = self._parse_json() or {}
+        pw = q.get("pw") or body.get("pw")
+        if pw != MONITOR_KEY:
             self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        confirm = body.get("confirm", q.get("confirm"))
+        if not destructive_confirm_ok(confirm):
+            self._json(400, {
+                "ok": False,
+                "error": "需要二次确认：请传 confirm=true 或 confirm=CLEANUP/UNBIND"
+                         "（Need second confirmation: pass confirm=true or confirm=CLEANUP/UNBIND）",
+            })
             return
         import shutil
         removed = []
+        skipped_protected = []
         for uid in sorted(os.listdir(USERS_DIR)):
             ud = os.path.join(USERS_DIR, uid)
             if not os.path.isdir(ud):
+                continue
+            if uid in ("vehicles", ".", ".."):
                 continue
             if os.path.exists(os.path.join(ud, "account.json")):
                 continue
             chats = self._try_json_json(os.path.join(ud, "chat.json")) or []
             if chats:
                 continue
+            if is_protected_unbind_uid(uid):
+                # 硬跳过：即使看起来像废账号，白名单目录也绝不删
+                skipped_protected.append(uid)
+                log_line("monitor_cleanup", f"跳过受保护账号 {uid}")
+                continue
             shutil.rmtree(ud, ignore_errors=True)
             removed.append(uid)
-        self._json(200, {"ok": True, "removed": removed})
+        self._json(200, {"ok": True, "removed": removed, "skipped_protected": skipped_protected})
+
+    def _api_monitor_unbind(self):
+        """运维解绑：MONITOR_KEY 鉴权，按 uid/uids 删除绑定文件（与 /api/unbind 同口径）。
+        须二次确认 confirm；白名单 uid 即使 confirm 也拒绝（单 uid→403；批量→该条 ok:false）。"""
+        q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())
+        body = self._parse_json() or {}
+        pw = q.get("pw") or body.get("pw")
+        if pw != MONITOR_KEY:
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        confirm = body.get("confirm", q.get("confirm"))
+        uids = []
+        one = str(body.get("uid") or "").strip()
+        if one:
+            uids.append(one)
+        for u in (body.get("uids") or []):
+            su = str(u or "").strip()
+            if su and su not in uids:
+                uids.append(su)
+        if not uids:
+            self._json(400, {"ok": False, "error": "uid_required"})
+            return
+        if not destructive_confirm_ok(confirm, uid=(uids[0] if len(uids) == 1 else None)):
+            self._json(400, {
+                "ok": False,
+                "error": "需要二次确认：请传 confirm=true 或 confirm=UNBIND"
+                         "（Need second confirmation: pass confirm=true or confirm=UNBIND）",
+            })
+            return
+        # 单目标且命中白名单 → 整请求 403；批量则逐条拒绝，不中断其余
+        if len(uids) == 1 and is_protected_unbind_uid(uids[0]):
+            log_line("monitor_unbind", f"拒绝销毁受保护账号 {uids[0]}")
+            self._json(403, {
+                "ok": False,
+                "error": "受保护账号禁止解绑/清理（Protected uid；移除须改代码白名单 + 周哥点头）",
+                "uid": uids[0],
+            })
+            return
+        results = []
+        for uid in uids:
+            if is_protected_unbind_uid(uid):
+                results.append({
+                    "uid": uid, "removed": [], "ok": False,
+                    "error": "protected_uid（受保护账号禁止解绑；须改代码白名单 + 周哥点头）",
+                })
+                log_line("monitor_unbind", f"拒绝销毁受保护账号 {uid}")
+                continue
+            if uid == "vehicles":
+                results.append({"uid": uid, "removed": [], "ok": False,
+                                "error": "refused: shared vehicles cache"})
+                log_line("monitor_unbind", "refused uid=vehicles")
+                continue
+            ud = user_dir(uid)
+            if not os.path.isdir(ud):
+                results.append({"uid": uid, "removed": [], "ok": False, "error": "not a directory"})
+                continue
+            removed, err = _unbind_user_files(uid)
+            # pair_state.json 按 uid 分键；只 pop 本 uid，不动其他用户
+            try:
+                p = _pair_state_path()
+                if os.path.exists(p):
+                    with open(p, "r", encoding="utf-8") as f:
+                        d = json.load(f) or {}
+                    if isinstance(d, dict) and uid in d:
+                        d.pop(uid, None)
+                        tmp = p + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(d, f, ensure_ascii=False, indent=2)
+                        os.replace(tmp, p)
+                        removed.append("pair_state")
+            except Exception as e:
+                log_line("monitor_unbind", f"清除 pair_state[{uid}] 失败: {e}")
+                if err is None:
+                    err = "pair_state: %s" % e
+            item = {"uid": uid, "removed": removed, "ok": err is None}
+            if err is not None:
+                item["error"] = err
+            results.append(item)
+            log_line("monitor_unbind",
+                     f"{uid} 解绑 ok={err is None} removed={','.join(removed) or '无'}")
+        self._json(200, {"ok": True, "results": results})
 
     def _api_monitor_events(self):
         q = dict((k, v[0]) for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "").items())

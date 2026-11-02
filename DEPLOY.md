@@ -122,3 +122,29 @@ sudo systemctl restart tesla-web
 5. **部署后自测**：登录、车控、行程列表 `/api/trip_list`，通过后再报完成。
 
 更完整表述见仓库根目录 `AGENTS.md`。
+
+## 12. 解绑 / 清理硬保护（API）
+
+> 2026-11-03：批量解绑与 cleanup 误伤主人绑定后增加。完整红线见 `AGENTS.md`。
+
+- 白名单（代码常量 `PROTECTED_UNBIND_UIDS`）：`E2299e37a4acc93ea44ca671e`、`demo01` — 即使 `confirm` 也拒绝销毁。
+- 破坏性接口须二次确认，例如：
+
+```bash
+# 用户自助解绑
+curl -X POST 'https://<host>/api/unbind' \
+  -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+  -d '{"confirm":"UNBIND"}'
+
+# 运维清理废账号
+curl -X POST 'https://<host>/api/monitor/cleanup?pw=<MONITOR_PASSWORD>' \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm":"CLEANUP"}'
+
+# 运维按 uid 解绑（可批量）
+curl -X POST 'https://<host>/api/monitor/unbind?pw=<MONITOR_PASSWORD>' \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm":"UNBIND","uids":["UID1","UID2"]}'
+```
+
+缺 `confirm` → 4xx 且不改文件；白名单 uid → 403。无超级旁路。
