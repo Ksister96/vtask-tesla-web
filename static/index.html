@@ -950,6 +950,11 @@ main{display:flex; flex:1 1 auto; min-width:0; min-height:0; height:0; width:100
 
 .msg::after{display:none;} /* 聊天气泡不叠加流光，避免遮挡文字 */
 
+.charge-cost-card{align-self:flex-start;width:min(88%,360px);box-sizing:border-box;padding:14px;border:1px solid #dce4dd;border-radius:16px;background:#fff;color:#172019;}.charge-cost-card.pending{cursor:pointer}.charge-cost-card.pending:active{transform:scale(.985)}
+.charge-cost-card.confirmed{border-color:#cce5d5}.ccc-head{display:flex;align-items:center;gap:9px}.ccc-icon{display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:10px;background:#e9f7ee;font-size:17px}.ccc-heading{display:flex;flex:1;flex-direction:column;min-width:0}.ccc-heading b{font-size:14px}.ccc-heading small,.ccc-station small{color:#849087;font-size:10.5px}.ccc-status{padding:3px 7px;border-radius:7px;background:#fff3dc;color:#a86608;font-size:10px;font-weight:600}.charge-cost-card.confirmed .ccc-status{background:#e9f7ee;color:#187546}.ccc-station{display:flex;flex-direction:column;margin-top:12px}.ccc-station b,.ccc-station small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ccc-station b{font-size:13px}.ccc-metrics{display:grid;grid-template-columns:1fr 1.35fr;gap:8px;margin-top:11px}.ccc-metric{display:flex;flex-direction:column;padding:9px 10px;border-radius:10px;background:#f5f7f5}.ccc-metric b{font-size:16px}.ccc-metric small{color:#7c8780;font-size:9.5px}.ccc-foot{display:flex;align-items:center;justify-content:space-between;margin-top:11px;color:#7e8982;font-size:10.5px}.ccc-foot button,.charge-cost-submit{border:0;border-radius:10px;background:#1f9d5a;color:#fff;font-weight:600}.ccc-foot button{height:32px;padding:0 13px}.ccc-done{color:#278659;font-weight:600}
+.charge-cost-overlay{position:fixed;inset:0;z-index:9999;display:flex;align-items:flex-end;justify-content:center;background:rgba(20,30,22,.34)}.charge-cost-dialog{width:min(100%,480px);box-sizing:border-box;padding:16px 20px max(20px,env(safe-area-inset-bottom));border-radius:22px 22px 0 0;background:#f8faf8}.charge-cost-dialog-head{display:flex;align-items:center;justify-content:space-between}.charge-cost-dialog-head h3{margin:0;font-size:18px}.charge-cost-dialog-head p{margin:3px 0 0;color:#7d8981;font-size:11px}.charge-cost-close{width:32px;height:32px;border:0;border-radius:50%;background:#e9eeea;color:#77828d;font-size:21px}.charge-cost-site{display:flex;flex-direction:column;margin-top:18px;padding:12px 13px;border:1px solid #e0e6e1;border-radius:12px;background:#fff}.charge-cost-site small{color:#858f88}.charge-cost-info{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}.charge-cost-info div{display:flex;flex-direction:column;padding:11px 12px;border-radius:12px;background:#eef3ef}.charge-cost-info small{color:#818c84}.charge-cost-label{display:block;margin-top:18px;color:#56625a;font-size:11px;font-weight:600}.charge-cost-input{display:flex;align-items:center;margin-top:7px;padding:4px 13px;border:1px solid #cfd8d1;border-radius:13px;background:#fff}.charge-cost-input span{font-size:22px;font-weight:700}.charge-cost-input input{flex:1;width:0;height:46px;margin-left:8px;border:0;outline:0;background:transparent;font-size:26px;font-weight:700}.charge-cost-submit{width:100%;height:46px;margin-top:18px;font-size:14px}.charge-cost-help,.charge-cost-error{margin-top:9px;font-size:10px;text-align:center}.charge-cost-help{color:#8b958e}.charge-cost-error{color:#c8493d}
+body.dark .charge-cost-card{border-color:#344039;background:#202923;color:#edf2ee}body.dark .ccc-icon,body.dark .charge-cost-card.confirmed .ccc-status{background:#293b31}body.dark .ccc-metric{background:#29322c}body.dark .charge-cost-dialog{background:#1b231e;color:#edf2ee}body.dark .charge-cost-site,body.dark .charge-cost-input{border-color:#38443c;background:#222c25;color:#edf2ee}body.dark .charge-cost-info div{background:#263129}body.dark .charge-cost-input input{color:#edf2ee}
+
 @keyframes pop{
 
   0%{opacity:0; transform:translateY(14px) scale(.86);}
@@ -5944,7 +5949,41 @@ var __locNode = null;   // 定位标签常驻节点：重建后挂回，不拆�
 
   window.__clearRecTip = clearRecTip;
 
-  function addMsg(who,text,tsStr,isTyping){
+  function chargeCardView(card){
+    if(!card || card.type!=='charge_cost') return null;
+    const confirmed=card.price_status==='confirmed';
+    const when=card.start ? fmtTimeTxt(new Date(Number(card.start)).toISOString().slice(0,19).replace('T',' ')) : '';
+    const root=document.createElement('div'); root.className='charge-cost-card '+(confirmed?'confirmed':'pending')+(card.station_name&&card.station_name!=='未知充电位置'?'':' station-pending');
+    const head=document.createElement('div'); head.className='ccc-head';
+    const icon=document.createElement('div'); icon.className='ccc-icon'; icon.textContent='⚡';
+    const heading=document.createElement('div'); heading.className='ccc-heading';
+    const title=document.createElement('b'); title.textContent='充电费用'; const time=document.createElement('small'); time.textContent=when;
+    heading.append(title,time); const status=document.createElement('span'); status.className='ccc-status'; status.textContent=confirmed?'已确认':(card.price_status==='remembered'?'参考价':'待确认');
+    head.append(icon,heading,status); root.appendChild(head);
+    const site=document.createElement('div'); site.className='ccc-station'; const siteName=document.createElement('b'); siteName.textContent=card.station_name||'未知充电位置'; site.appendChild(siteName);
+    if(card.station_address){ const address=document.createElement('small'); address.textContent=card.station_address; site.appendChild(address); } root.appendChild(site);
+    const metrics=document.createElement('div'); metrics.className='ccc-metrics';
+    const energy=document.createElement('div'); energy.className='ccc-metric'; const energyValue=document.createElement('b'); energyValue.textContent=Number(card.kwh||0).toFixed(2); const energyLabel=document.createElement('small'); energyLabel.textContent='kWh'+(card.estimated?' · 估算':''); energy.append(energyValue,energyLabel);
+    const cost=document.createElement('div'); cost.className='ccc-metric'; const costValue=document.createElement('b'); costValue.textContent=card.total_cost==null?'待填写':'¥'+Number(card.total_cost).toFixed(2); const costLabel=document.createElement('small'); costLabel.textContent=card.unit_price==null?'填写实付金额后自动计算':Number(card.unit_price).toFixed(2)+' 元/kWh'; cost.append(costValue,costLabel); metrics.append(energy,cost); root.appendChild(metrics);
+    const foot=document.createElement('div'); foot.className='ccc-foot'; const kind=document.createElement('span'); kind.textContent=card.charge_type==='dc_fast'?'直流快充':(card.charge_type==='ac'?'交流慢充':'充电'); foot.appendChild(kind);
+    if(confirmed){ const done=document.createElement('span'); done.className='ccc-done'; done.textContent='已完成记账'; foot.appendChild(done); }
+    else { root.onclick=function(){ openChargeCostDialog(card); }; const action=document.createElement('button'); action.type='button'; action.textContent='填写实付金额'; action.onclick=function(event){ event.stopPropagation(); openChargeCostDialog(card); }; foot.appendChild(action); }
+    root.appendChild(foot); return root;
+  }
+
+  function openChargeCostDialog(card){
+    const overlay=document.createElement('div'); overlay.className='charge-cost-overlay';
+    const dialog=document.createElement('div'); dialog.className='charge-cost-dialog'; overlay.appendChild(dialog);
+    const head=document.createElement('div'); head.className='charge-cost-dialog-head'; const copy=document.createElement('div'); const h=document.createElement('h3'); h.textContent='确认充电费用'; const p=document.createElement('p'); p.textContent='只需填写实际支付金额'; copy.append(h,p); const close=document.createElement('button'); close.className='charge-cost-close'; close.textContent='×'; close.onclick=function(){ overlay.remove(); }; head.append(copy,close); dialog.appendChild(head);
+    const site=document.createElement('div'); site.className='charge-cost-site'; const name=document.createElement('b'); name.textContent=card.station_name||'未知充电位置'; site.appendChild(name); if(card.station_address){ const address=document.createElement('small'); address.textContent=card.station_address; site.appendChild(address); } dialog.appendChild(site);
+    const info=document.createElement('div'); info.className='charge-cost-info'; const energy=document.createElement('div'); const energyValue=document.createElement('b'); energyValue.textContent=Number(card.kwh||0).toFixed(2); const energyLabel=document.createElement('small'); energyLabel.textContent='充电量 kWh'; energy.append(energyValue,energyLabel); const kind=document.createElement('div'); const kindValue=document.createElement('b'); kindValue.textContent=card.charge_type==='dc_fast'?'直流快充':(card.charge_type==='ac'?'交流慢充':'充电'); const kindLabel=document.createElement('small'); kindLabel.textContent='本次充电'; kind.append(kindValue,kindLabel); info.append(energy,kind); dialog.appendChild(info);
+    const label=document.createElement('label'); label.className='charge-cost-label'; label.textContent='实际支付'; dialog.appendChild(label); const field=document.createElement('div'); field.className='charge-cost-input'; const currency=document.createElement('span'); currency.textContent='¥'; const input=document.createElement('input'); input.type='number'; input.inputMode='decimal'; input.placeholder='0.00'; field.append(currency,input); dialog.appendChild(field);
+    const submit=document.createElement('button'); submit.className='charge-cost-submit'; submit.textContent='确认并记账'; const error=document.createElement('div'); error.className='charge-cost-error'; const help=document.createElement('div'); help.className='charge-cost-help'; help.textContent='也可以关闭这里，直接发送“这次充电58元”'; dialog.append(submit,error,help);
+    submit.onclick=async function(){ const amount=Number(input.value); if(!amount||amount<=0||amount>=100000){ error.textContent='请输入实际支付金额'; return; } submit.disabled=true; submit.textContent='正在保存'; error.textContent=''; try{ const response=await fetch(API+'/api/charge_session/update',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({id:card.session_id,total_cost:Math.round(amount*100)/100})}); const result=await response.json(); if(!response.ok||!result.ok) throw new Error(result.error||'保存失败'); overlay.remove(); await loadChatHistory(); }catch(e){ error.textContent=e.message||'保存失败，请重试'; submit.disabled=false; submit.textContent='确认并记账'; } };
+    overlay.onclick=function(e){ if(e.target===overlay) overlay.remove(); }; document.body.appendChild(overlay); setTimeout(function(){ input.focus(); },80);
+  }
+
+  function addMsg(who,text,tsStr,isTyping,card){
 
     const main=$('#chat');
 
@@ -5966,6 +6005,11 @@ var __locNode = null;   // 定位标签常驻节点：重建后挂回，不拆�
 
       addTimeShould(who, tsStr);
 
+    }
+
+    if(card && who!=='me'){
+      const cardNode=chargeCardView(card);
+      if(cardNode){ main.appendChild(cardNode); main.scrollTop=main.scrollHeight; return cardNode; }
     }
 
     d.className='msg '+(who==='me'?'me':who==='err'?'err':'car');
@@ -6180,7 +6224,7 @@ var __locNode = null;   // 定位标签常驻节点：重建后挂回，不拆�
 
       if(!messages.length) addMsg('sys','绑定后，直接说要干什么，比如「锁车」「开空调」「查电量」；设置 → 账户 可解绑车辆');
 
-      shown.forEach(m=>{ addMsg(m.who==='me'?'me':m.who, m.text, m.ts); });
+      shown.forEach(m=>{ addMsg(m.who==='me'?'me':m.who, m.text, m.ts, false, m.card); });
 
       main.scrollTop=main.scrollHeight; window.__chatLen=messages.length;
 
@@ -6367,6 +6411,8 @@ var __locNode = null;   // 定位标签常驻节点：重建后挂回，不拆�
       }
 
       lastStateTs=0; clearTypingBubble(typing, d.reply); try{recordOpSuccess();}catch(e){}
+
+      if(d.charge_cost_recorded) setTimeout(function(){ loadChatHistory(); },0);
 
       if(d.pairing && window.__showPairGuide){ window.__showPairGuide('rejected'); }
 
@@ -8591,7 +8637,7 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
 
 
 
-  async function refreshState(silent){
+  async function refreshState(silent, quiet){
 
     if(!token) return;
 
@@ -8613,7 +8659,7 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
 
     try{
 
-      const r=await fetch(API+'/api/state',{headers:{'Authorization':'Bearer '+token}});
+      const r=await fetch(API+'/api/state'+(quiet?'?quiet=1':''),{headers:{'Authorization':'Bearer '+token}});
 
       if(r.status===401){ showLogin(); return; }
 
@@ -8621,23 +8667,8 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
 
       if(d.ok&&d.state){
 
-        var __fp=d.state+'|'+JSON.stringify(d.vehicle_data||{});
-
-        if(__fp===refreshState._last){ lastStateTs=Date.now(); return; }   // 同帧去抖（2026-10-11）
-
-        refreshState._last=__fp;
-
-        dbSyncReal(d.vehicle_data);  // 真实车况纠正多态档位（休眠时用缓存快照）
-
-        renderStateCard(d.state);
-
-        Promise.resolve().then(function(){ try{ if(window.__tkReattach) window.__tkReattach(); renderLocCard(d.vehicle_data); }catch(e){ window.__locErr=String((e&&e.stack)||e).slice(0,400); } });
-
-
-
-
-
-        lastStateTs=Date.now();
+        d._transport=quiet?'rest_quiet':'rest';
+        applyStateFrame(d);
 
       } else {
 
@@ -8677,11 +8708,71 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
 
   let esRetryT = null;     // 断线重连定时器
 
+  let esStateWatchT = null; // 连接活着但无 state 帧时，quiet REST 兜底
+
+
+
+  function stateMetaTs(meta){
+
+    meta=meta||{};
+
+    return Number(meta.vehicle_ts||meta.ingest_ts||0);
+
+  }
+
+
+
+  function recordStateDiagnostic(d, applied, reason){
+
+    var m=(d&&d.state_meta)||{};
+
+    var row={receiveTs:Date.now(),transport:(d&&d._transport)||'unknown',applied:!!applied,
+
+      reason:reason||'',source:String(m.source||''),stale:!!m.stale,
+
+      ageMs:Number.isFinite(Number(m.age_ms))?Number(m.age_ms):null,
+
+      vehicleTs:Number(m.vehicle_ts)||null,ingestTs:Number(m.ingest_ts)||null,publishTs:Number(m.publish_ts)||null};
+
+    window.__stateDiagnostics=(window.__stateDiagnostics||[]).concat([row]).slice(-30);
+
+    try{ localStorage.setItem('cm_state_diag',JSON.stringify(window.__stateDiagnostics)); }catch(e){}
+
+  }
+
+
+
+  function armStateWatch(){
+
+    if(esStateWatchT) clearTimeout(esStateWatchT);
+
+    esStateWatchT=setTimeout(function(){ refreshState(true,true); armStateWatch(); },30000);
+
+  }
+
 
 
   function applyStateFrame(d){
 
     if(!d || !d.ok || !d.state) return;
+
+    var _metaTs=stateMetaTs(d.state_meta);
+
+    if(_metaTs&&applyStateFrame._lastMetaTs&&_metaTs<applyStateFrame._lastMetaTs){ recordStateDiagnostic(d,false,'older_frame'); return; }
+
+    if(_metaTs) applyStateFrame._lastMetaTs=_metaTs;
+
+    recordStateDiagnostic(d,true,'applied');
+
+    var _u=$('#updated'); if(_u){
+
+      var _m=d.state_meta||{};
+
+      _u.textContent=_m.stale?'最后已知':new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
+
+      _u.title='来源 '+(_m.source||'未知')+' · 数据年龄 '+(_m.age_ms==null?'未知':Math.round(_m.age_ms/1000)+'秒');
+
+    }
 
     var __fp=d.state+'|'+JSON.stringify(d.vehicle_data||{});
 
@@ -8696,8 +8787,6 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
     Promise.resolve().then(function(){ try{ if(window.__tkReattach) window.__tkReattach(); renderLocCard(d.vehicle_data); }catch(e){ window.__locErr=String((e&&e.stack)||e).slice(0,400); } });
 
     lastStateTs=Date.now();
-
-    var _u=$('#updated'); if(_u) _u.textContent=new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
 
   }
 
@@ -8715,6 +8804,10 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
 
       esConn = new EventSource(API+'/api/stream?token='+encodeURIComponent(token));
 
+      armStateWatch();
+
+      esConn.onopen = function(){ armStateWatch(); };
+
     }catch(e){ esConn=null; return; }
 
     esConn.onmessage = function(ev){
@@ -8727,7 +8820,9 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
 
         if(d.type==='state'){
 
-          applyStateFrame({ok:true, state:d.state, vehicle_data:d.vehicle_data});
+          armStateWatch();
+
+          applyStateFrame({ok:true, state:d.state, vehicle_data:d.vehicle_data, state_meta:d.state_meta, _transport:'sse'});
 
         }
 
@@ -8768,6 +8863,8 @@ let warmStream=null;   // 麦克风权限常驻（2026-10-11 用户要求）：�
   function stopStateAuto(){
 
     if(esRetryT){ clearTimeout(esRetryT); esRetryT=null; }
+
+    if(esStateWatchT){ clearTimeout(esStateWatchT); esStateWatchT=null; }
 
     if(esConn){ try{ esConn.close(); }catch(e){} esConn=null; }
 
@@ -9627,7 +9724,7 @@ function openScenEditor(){ scenPicked=[]; document.getElementById('stt-scen-name
 
 async function saveScenario(){ const name=(document.getElementById('stt-scen-name').value||'').trim(); if(!name){ alert('先给场景起个名'); return; } if(!scenPicked.length){ alert('至少选 1 步'); return; } try{ const list=SCEN.filter(function(x){return x.name!==name;}).concat([{name:name, items:scenPicked.slice()}]); const r=await fetch(API+'/api/scenarios',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({scenarios:list})}); const d=await r.json(); if(d.ok){ SCEN=d.scenarios||list; document.getElementById('stt-scen-editor').classList.add('hidden'); renderScenList(); renderQuick(); } else alert(d.error||'保存失败'); }catch(e){ alert('网络错误'); } }
 
-function startChatTail(){ if(window.__chatTailTimer) return; window.__chatTailTimer=setInterval(async function(){ try{ if(document.visibilityState!=='visible'||busy||!token) return; const typing=document.querySelector('#chat .typing'); if(typing) return; const r=await fetch(API+'/api/chat/history',{headers:{'Authorization':'Bearer '+token}}); if(r.status!==200) return; const d=await r.json(); if(!d.ok) return; const len=(d.messages||[]).length; if(len<=(window.__chatLen||0)) return; const main=document.getElementById('chat'); const stick=main.scrollHeight-main.scrollTop-main.clientHeight<80; await loadChatHistory(); if(!stick && main) main.scrollTop=main.scrollHeight; }catch(e){} }, 30000); }
+function startChatTail(){ if(window.__chatTailTimer) return; window.__chatTailTimer=setInterval(async function(){ try{ if(document.visibilityState!=='visible'||busy||!token) return; const typing=document.querySelector('#chat .typing'); if(typing) return; const r=await fetch(API+'/api/chat/history',{headers:{'Authorization':'Bearer '+token}}); if(r.status!==200) return; const d=await r.json(); if(!d.ok) return; const len=(d.messages||[]).length; if(len<=(window.__chatLen||0) && !document.querySelector('.charge-cost-card.station-pending')) return; const main=document.getElementById('chat'); const stick=main.scrollHeight-main.scrollTop-main.clientHeight<80; await loadChatHistory(); if(!stick && main) main.scrollTop=main.scrollHeight; }catch(e){} }, 30000); }
 
 function initChatExtras(){ loadScenarios(); startChatTail(); }
 
@@ -15234,9 +15331,7 @@ const _cs2=document.getElementById('ws-com-search'); if(_cs2) _cs2.style.display
 
         cell(d.avg_kmh, 'km/h', '平均车速'),
 
-        cell(d.max_kmh, 'km/h', '最高车速'),
-
-        cell(d.range_change_km !== undefined ? d.range_change_km : null, 'km', '续航变化'),
+        cell(d.max_kmh, 'km/h', d.max_kmh_reliable === false ? '已记录最高车速' : '最高车速'),
 
         cell(d.range_consumed_km, 'km', '续航消耗'),
 

@@ -1,51 +1,35 @@
-# -*- coding: utf-8 -*-
-"""行程详情起终点地址修复（小程序 /api/trip_list 与网页详情共用口径）。
-
-历史结算文件可能留下占位文案、坐标串或仅到市/区级的短地址；列表接口在返回前
-按需调用 refresh_addresses，成功后由调用方原子回写 JSON。
-"""
+"""Trip address cache validation and coordinate-based repair helpers."""
 import re
 
-# 与 car-web-multi._api_trip_detail 旧缓存升级规则对齐
-_BAD_PLACEHOLDERS = ("", "未知位置", "未知", "起点", "终点")
 
-
-def _is_bad_addr(addr):
-    s = str(addr or "").strip()
-    if s in _BAD_PLACEHOLDERS:
+def needs_refresh(value):
+    """Return True for missing, placeholder, coordinate-only or district-only labels."""
+    text = str(value or "").strip()
+    if not text or "未知" in text:
         return True
-    if re.search(r"\d{1,3}\.\d{3,}", s):
+    if re.search(r"\d{1,3}\.\d{3,}", text):
         return True
-    if re.fullmatch(r"[^市县区]{0,3}[市县区]", s):
-        return True
-    return False
+    return bool(re.fullmatch(r"[^市县区]{0,3}[市县区]", text))
 
 
-def refresh_addresses(detail, regeo_fn):
-    """若 start/end 地址为占位或短地址，用 regeo_fn(lat, lon) 回填。
-
-    Args:
-        detail: trip_details/*.json 结算 dict（就地修改）
-        regeo_fn: 逆地理函数，签名 (lat, lon) -> str|None/空串
-
-    Returns:
-        True 表示至少改写了一处地址（调用方应原子回写）；否则 False。
-    """
-    if not isinstance(detail, dict) or not callable(regeo_fn):
-        return False
-    changed = False
-    for tag in ("start", "end"):
-        coord = detail.get(tag + "_coord")
-        addr_key = tag + "_addr"
-        if not (isinstance(coord, (list, tuple)) and len(coord) >= 2):
+def refresh_addresses(detail, resolver):
+    """Repair bad start/end labels from [lat, lon] coordinates; return changed keys."""
+    changed = []
+    for address_key, coord_key in (("start_addr", "start_coord"),
+                                   ("end_addr", "end_coord")):
+        if not needs_refresh(detail.get(address_key)):
             continue
-        if not _is_bad_addr(detail.get(addr_key)):
+        coord = detail.get(coord_key)
+        if not isinstance(coord, (list, tuple)) or len(coord) < 2:
             continue
         try:
-            name = regeo_fn(float(coord[0]), float(coord[1]))
+            lat, lon = float(coord[0]), float(coord[1])
+            resolved = str(resolver(lat, lon) or "").strip()
+        except (TypeError, ValueError, OverflowError):
+            continue
         except Exception:
-            name = None
-        if name and not _is_bad_addr(name):
-            detail[addr_key] = name
-            changed = True
+            continue
+        if resolved and not needs_refresh(resolved):
+            detail[address_key] = resolved
+            changed.append(address_key)
     return changed

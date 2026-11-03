@@ -21,6 +21,7 @@ import hmac
 import json
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -32,12 +33,21 @@ from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import re
 import math
+import parking_ledger
+from weather_bridge import weather_for_fields
 try:
     import fcntl
 except ImportError:
     fcntl = None   # Windows 本地开发无 fcntl；服务器 Linux 必有
 
 import car_schedule_multi as schedule
+from state_observability import build_state_meta, uid_tag
+from vehicle_measurements import normalize as normalize_measurements
+from charging_history import read_sessions
+from charging_ledger import (confirm_session_cost, decorate_sessions, latest_card_candidate, latest_pending,
+                             mark_pending_notified, mark_station_lookup_attempt, parse_charge_cost_text,
+                             save_station_match)
+from trip_addresses import refresh_addresses as refresh_trip_addresses
 
 # 邮箱验证码登录（stdlib + SQLite；2026-10-17 起唯一登录方式，访问码/设备码下线）
 from email_auth import EmailAuthStore, AuthError
@@ -51,11 +61,46 @@ USERS_DIR = os.path.join(BASE, "users")
 CODES_FILE = os.path.join(BASE, "friends-codes.json")
 EMAIL_AUTH = EmailAuthStore(BASE)   # 邮箱身份库 identity.sqlite3（邮箱→uid + 验证码挑战 + 频控）
 LOG_FILE = os.path.join(BASE, "multi-web.log")
+STATE_DIAG_DIR = os.path.join(BASE, "state_diag")
+TELEMETRY_NOTIFY_HOST = "127.0.0.1"
+TELEMETRY_NOTIFY_PORT = int(os.environ.get("TELEMETRY_NOTIFY_PORT", "18796"))
+TELEMETRY_NOTIFY_FALLBACK_SECONDS = 2.0
 AMAP_KEY_FILE = os.path.join(BASE, "amap_key.txt")
 AMAP_MAP_SEM = threading.BoundedSemaphore(1)
 # 小程序（微信）凭据：环境变量注入；两者齐备走真 code2session，缺省为 mock 模式
 MP_WX_APPID = os.environ.get("MP_WX_APPID", "")
+_WXMSG_TOKEN = {"tok": "", "ts": 0}   # 订阅消息 access_token 进程级缓存
+WXMSG_TRIP_TMPL = "zErBRh7BVm9q7SEJe8FpINXm0qg8Af5oDNHCsMrSDxM"   # 行程通知订阅模板
 MP_WX_SECRET = os.environ.get("MP_WX_SECRET", "")
+
+VOICE_SILENCE_HALLUCINATIONS = {"我", "嗯", "啊", "呃", "额", "哦"}
+
+def is_voice_failure_transcript(text):
+    value = str(text or "")
+    return bool(re.search(r"语音.*(?:未能识别|未识别|识别失败)", value))
+
+def is_empty_voice_transcript(text):
+    """过滤 Whisper 在静音片段上偶发生成的无语义单字，不误伤正常句子。"""
+    compact = re.sub(r"[\s，。！？、,.!?…~～]+", "", str(text or ""))
+    return not compact or compact in VOICE_SILENCE_HALLUCINATIONS or is_voice_failure_transcript(text)
+
+def visible_chat_messages(messages):
+    """响应时隐藏历史上被语音服务误写入的失败占位文案及其无效回复。"""
+    visible = []
+    skip_failed_reply = False
+    for message in messages:
+        who = message.get("who") if isinstance(message, dict) else ""
+        text = message.get("text") if isinstance(message, dict) else ""
+        if who in ("me", "you") and is_voice_failure_transcript(text):
+            skip_failed_reply = True
+            continue
+        if (skip_failed_reply and who == "car"
+                and re.search(r"未识别到可执行|没有理解|无法识别", str(text or ""))):
+            skip_failed_reply = False
+            continue
+        skip_failed_reply = False
+        visible.append(message)
+    return visible
 
 # 监控大屏：手机可访问的实时用户操作面板
 # 密码三种来源：环境变量 MONITOR_PASSWORD > 配置文件 monitor.json > 自动生成并写入 monitor.json
@@ -547,6 +592,48 @@ def regeo_district(lat, lon):
     return _regeo_full(lat, lon)[1]
 
 
+def nearest_charge_station(lat, lon):
+    """Match one nearby charging POI. Vehicle coordinates are WGS84; AMap expects GCJ02."""
+    key = load_amap_key()
+    if not key or lat is None or lon is None:
+        return None
+    try:
+        gcj_lon, gcj_lat = wgs84_to_gcj02(float(lon), float(lat))
+        query = urllib.parse.urlencode({
+            "key": key, "location": "%.6f,%.6f" % (gcj_lon, gcj_lat),
+            "keywords": "充电站", "types": "011100", "radius": 1200,
+            "sortrule": "distance", "offset": 5, "page": 1, "extensions": "base",
+        })
+        with urllib.request.urlopen("https://restapi.amap.com/v3/place/around?" + query, timeout=6) as response:
+            data = json.load(response)
+        pois = data.get("pois") or []
+        if not pois:
+            return None
+        poi = next((p for p in pois if re.search(r"特斯拉|超充|充电", str(p.get("name") or ""), re.I)), pois[0])
+        distance = poi.get("distance")
+        return {"poi_id": poi.get("id") or "", "name": poi.get("name") or "充电站",
+                "address": poi.get("address") if isinstance(poi.get("address"), str) else "",
+                "distance_m": int(float(distance)) if distance not in (None, "") else None,
+                "lat": float(lat), "lon": float(lon)}
+    except Exception as error:
+        log_line("charge", "充电站匹配失败: %s" % error)
+        return None
+
+
+def charge_cost_card(session):
+    """Public chat-card payload; raw coordinates and VIN never leave the server."""
+    return {
+        "type": "charge_cost", "session_id": session["id"],
+        "station_name": session.get("station_name") or "未知充电位置",
+        "station_address": session.get("station_address") or "",
+        "start": session.get("start"), "end": session.get("end"),
+        "kwh": session.get("kwh"), "charge_type": session.get("charge_type") or "",
+        "price_status": session.get("price_status") or "pending",
+        "unit_price": session.get("unit_price"), "total_cost": session.get("total_cost"),
+        "estimated": bool(session.get("estimated")),
+    }
+
+
 def bind_profile_snapshot(uid, vid, tok):
     """绑定建档：全量 vehicle_data 存 vehicle_meta.json（车身色/车型/配置一次到位）。"""
     try:
@@ -579,6 +666,39 @@ def log_line(kind, msg):
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{now_iso()}] {kind}: {msg}\n")
+    except Exception:
+        pass
+
+
+_state_diag_last = {}
+_state_diag_cleanup_day = ""
+
+
+def _log_state_diag(uid, channel, meta):
+    """限频记录脱敏链路指标；陈旧状态每15秒、正常状态每通道每分钟至多一条。"""
+    global _state_diag_cleanup_day
+    try:
+        now = time.time()
+        key = (str(uid or ""), str(channel or ""))
+        interval = 15 if meta.get("stale") else 60
+        if now - _state_diag_last.get(key, 0) < interval:
+            return
+        _state_diag_last[key] = now
+        safe = {k: meta.get(k) for k in (
+            "source", "fresh", "stale", "age_ms", "vehicle_ts", "ingest_ts", "publish_ts")}
+        safe.update({"uid_tag": uid_tag(uid), "channel": channel,
+                     "logged_ts": int(now * 1000)})
+        os.makedirs(STATE_DIAG_DIR, exist_ok=True)
+        day = time.strftime("%Y%m%d", time.localtime(now))
+        with open(os.path.join(STATE_DIAG_DIR, "state-%s.jsonl" % day), "a", encoding="utf-8") as f:
+            f.write(json.dumps(safe, ensure_ascii=False, separators=(",", ":")) + "\n")
+        if _state_diag_cleanup_day != day:
+            _state_diag_cleanup_day = day
+            cutoff = now - 14 * 86400
+            for name in os.listdir(STATE_DIAG_DIR):
+                path = os.path.join(STATE_DIAG_DIR, name)
+                if name.startswith("state-") and name.endswith(".jsonl") and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
     except Exception:
         pass
 
@@ -1070,10 +1190,53 @@ def save_chat(uid, messages):
         json.dump(messages, f, ensure_ascii=False, indent=2)
     os.replace(tmp, chat_path(uid))
 
-def append_chat(uid, who, text):
+def hydrate_trip_chat_cards(uid, messages):
+    """为旧版行程完成通知补上详情入口；只改本次响应，不重写聊天历史。"""
+    pending = [m for m in messages if isinstance(m, dict) and m.get("who") == "sys"
+               and "行程完成" in str(m.get("text") or "")
+               and not ((m.get("card") or {}).get("type") == "trip_detail")]
+    if not pending:
+        return messages
+    ddir = os.path.join(user_dir(uid), "trip_details")
+    try:
+        names = sorted((n for n in os.listdir(ddir) if re.fullmatch(r"\d{8}-\d{6}\.json", n)),
+                       reverse=True)[:200]
+    except OSError:
+        return messages
+    trips = []
+    for name in names:
+        tid = name[:-5]
+        try:
+            with open(os.path.join(ddir, name), "r", encoding="utf-8") as f:
+                detail = json.load(f)
+            started = datetime.strptime(tid, "%Y%m%d-%H%M%S").timestamp()
+            ended = started + max(0.0, float(detail.get("duration_min") or 0)) * 60
+            trips.append((tid, ended, float(detail.get("distance_km") or 0)))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    used = set()
+    for message in pending:
+        try:
+            stamp = datetime.fromisoformat(str(message.get("ts") or "").replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError):
+            continue
+        km_match = re.search(r"行程完成[^\d]*(\d+(?:\.\d+)?)\s*km", str(message.get("text") or ""), re.I)
+        msg_km = float(km_match.group(1)) if km_match else None
+        candidates = [t for t in trips if t[0] not in used
+                      and (msg_km is None or abs(t[2] - msg_km) <= 0.5)]
+        if not candidates:
+            continue
+        match = min(candidates, key=lambda t: abs(t[1] - stamp))
+        if abs(match[1] - stamp) <= 30 * 60:
+            message["card"] = {"type": "trip_detail", "trip_id": match[0]}
+            used.add(match[0])
+    return messages
+
+def append_chat(uid, who, text, card=None):
     text = str(text or "").strip()
     if not text:
         return
+    os.makedirs(user_dir(uid), exist_ok=True)
     with _chat_lock:
         # flock 与 track_watcher 的 sys_msg 跨进程互斥（2026-10-23），防原子替换互踩丢消息
         with open(os.path.join(user_dir(uid), ".chat.lock"), "a+") as lf:
@@ -1081,8 +1244,41 @@ def append_chat(uid, who, text):
                 fcntl.flock(lf, fcntl.LOCK_EX)
             try:
                 messages = load_chat(uid)
-                messages.append({"who": who, "text": text, "ts": now_iso()})
+                message = {"who": who, "text": text, "ts": now_iso()}
+                if isinstance(card, dict) and card.get("type") == "charge_cost":
+                    message["card"] = card
+                messages.append(message)
                 save_chat(uid, messages)
+            finally:
+                if fcntl:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+
+def append_charge_card_once(uid, text, session_id):
+    """按账单会话去重写入费用卡片；以 chat.json 实际内容作为成功依据。"""
+    text = str(text or "").strip()
+    session_id = str(session_id or "").strip()
+    if not text or not session_id:
+        return False
+    os.makedirs(user_dir(uid), exist_ok=True)
+    with _chat_lock:
+        with open(os.path.join(user_dir(uid), ".chat.lock"), "a+") as lf:
+            if fcntl:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                messages = load_chat(uid)
+                for message in messages:
+                    card = message.get("card") if isinstance(message, dict) else None
+                    if (isinstance(card, dict) and card.get("type") == "charge_cost"
+                            and str(card.get("session_id") or "") == session_id):
+                        return False
+                messages.append({
+                    "who": "car",
+                    "text": text,
+                    "ts": now_iso(),
+                    "card": {"type": "charge_cost", "session_id": session_id},
+                })
+                save_chat(uid, messages)
+                return True
             finally:
                 if fcntl:
                     fcntl.flock(lf, fcntl.LOCK_UN)
@@ -1490,6 +1686,8 @@ def _vehicle_data_fields(uid):
         "steering_wheel_heater": (int(swh) > 0) if swh is not None else None,
         "has_seat_cooling": has_cooling,
         "seat_cooler_level": int(cooler_left) if cooler_left is not None else 0,
+        # 座椅加热档位（0=关,1-3）：仪表盘座椅按钮四态循环靠它同步状态（2026-10-26）
+        "seat_heater_left": cl.get("seat_heater_left"),
         "charging": bool(cs.get("charging_state") in ("Charging", "Starting", "Complete")),
         "battery_level": cs.get("battery_level"),
         "charging_state": cs.get("charging_state"),
@@ -1509,6 +1707,12 @@ def _vehicle_data_fields(uid):
         "charge_rate": cs.get("charge_rate"),
         "time_to_full_charge": cs.get("time_to_full_charge"),
         "charger_power": cs.get("charger_power"),
+        # 充电账单：本次会话已充电量（车端累计），前端实时显示/本地记账基准（2026-10-25）
+        "charge_energy_added": cs.get("charge_energy_added"),
+        "charger_voltage": cs.get("charger_voltage"),
+        "charger_actual_current": cs.get("charger_actual_current"),
+        "ac_charging_power": cs.get("ac_charging_power"),
+        "dc_charging_power": cs.get("dc_charging_power"),
         # [2026-10-06] 定位字段透传（endpoints 带 location_data 后可用）：行驶回顾/地图用
         "latitude": (v.get("drive_state") or {}).get("latitude"),
         "longitude": (v.get("drive_state") or {}).get("longitude"),
@@ -1561,6 +1765,42 @@ def _fields_to_text(fields):
 # ---- SSE 客户端注册表与唤醒阶段广播（唤醒等待可视化） ----
 _sse_clients = {}            # uid -> [handler, ...]
 _sse_lock = threading.Lock()
+_telemetry_condition = threading.Condition()
+_telemetry_versions = {}     # vin -> 单调递增通知序号；只用于唤醒，状态仍从原子快照读取
+_telemetry_notify_ready = False
+
+
+def _telemetry_notify_loop(sock):
+    """接收 ingest 的本机通知，让 SSE 从定时扫文件变为数据到达即读取。"""
+    while True:
+        try:
+            raw, _address = sock.recvfrom(128)
+            vin = raw.decode("ascii", errors="ignore").strip().upper()
+            if not vin or len(vin) > 64 or not vin.isalnum():
+                continue
+            with _telemetry_condition:
+                _telemetry_versions[vin] = _telemetry_versions.get(vin, 0) + 1
+                _telemetry_condition.notify_all()
+        except Exception as error:
+            log_line("stream", "遥测即时通知异常: %s" % error)
+            time.sleep(0.2)
+
+
+def _start_telemetry_notify_listener():
+    global _telemetry_notify_ready
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((TELEMETRY_NOTIFY_HOST, TELEMETRY_NOTIFY_PORT))
+    except OSError as error:
+        log_line("stream", "遥测即时通知监听失败，保留0.5秒兜底: %s" % error)
+        return False
+    _telemetry_notify_ready = True
+    thread = threading.Thread(target=_telemetry_notify_loop, args=(sock,),
+                              name="telemetry-notify", daemon=True)
+    thread.start()
+    log_line("stream", "遥测即时通知监听: %s:%s" % (TELEMETRY_NOTIFY_HOST, TELEMETRY_NOTIFY_PORT))
+    return True
 
 
 def _sse_emit(uid, obj):
@@ -1583,6 +1823,7 @@ def _inject_meta_fields(vin_full, fields):
     """VIN 档案元数据/兜底注入——/api/state 与 SSE 遥测帧共用（2026-10-07）。
     SSE 帧曾经不走注入：行车中每几秒推一帧把胎压/定位卡片数据冲掉
     （用户实测：行车中胎压消失、定位冻结在原地）。"""
+    fields = dict(fields or {})
     try:
         meta = vehicle_archive_read(vin_full) or {}
         add = {k: meta.get(k) for k in ("car_type", "trim_badging") if meta.get(k)}
@@ -1610,11 +1851,12 @@ def _inject_meta_fields(vin_full, fields):
             add["location_stale"] = True
             add["location_ts"] = meta.get("updated") or ""   # 兜底也用稳定值：now_iso 会让SSE签名持续抖动
         if add:
-            fields = dict(fields or {})
             fields.update(add)
-            fields.pop("_frame_ts", None)
     except Exception:
         pass
+    # 链路诊断时间戳只放在顶层 state_meta，避免污染车辆字段和 SSE 去重签名。
+    for key in ("_frame_ts", "_vehicle_ts", "_ingest_ts"):
+        fields.pop(key, None)
     return fields
 
 
@@ -2347,6 +2589,93 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
                    "fee": round(agg["kwh"] * 1.0, 2), "month": month_prefix}
         self._json(200, {"ok": True, "days": days, "trips": items, "summary": summary})
 
+    def _charge_sessions_data(self, uid, vin, cutoff, match_station=True):
+        raw = read_sessions(USERS_DIR, uid, vin, cutoff)
+        out = decorate_sessions(USERS_DIR, uid, vin, raw)
+        # Compatibility for sessions settled before location fields were added:
+        # use the current telemetry snapshot only when its timestamp is close enough
+        # to the charge end to prove the vehicle had not subsequently moved away.
+        snapshot = self._read_telemetry_state(vin)
+        if snapshot:
+            fields = snapshot.get("fields") or {}
+            snap_ms = float(snapshot.get("ts") or 0) * 1000
+            snap_lat, snap_lon = fields.get("latitude"), fields.get("longitude")
+            if snap_lat is not None and snap_lon is not None:
+                for item in reversed(out):
+                    ended = float(item.get("end") or item.get("start") or 0)
+                    if (item.get("latitude") is None and ended and abs(snap_ms - ended) <= 30 * 60 * 1000):
+                        item["latitude"], item["longitude"] = snap_lat, snap_lon
+                        break
+        # Only unresolved sessions are geocoded and the result is persisted, so opening
+        # the bill repeatedly does not consume map quota or delay every request.
+        now_ms = time.time() * 1000
+        unresolved = [q for q in reversed(out) if match_station and not q.get("station_name")
+                      and q.get("latitude") is not None and q.get("longitude") is not None
+                      and (not q.get("station_lookup_at")
+                           or now_ms - float(q.get("station_lookup_at") or 0) >= 86400000)][:3]
+        for item in unresolved:
+            station = nearest_charge_station(item.get("latitude"), item.get("longitude"))
+            if station:
+                save_station_match(USERS_DIR, uid, vin, item.get("start"), station)
+            else:
+                mark_station_lookup_attempt(USERS_DIR, uid, vin, item.get("start"))
+        if unresolved:
+            out = decorate_sessions(USERS_DIR, uid, vin, raw)
+        return out
+
+    def _ensure_charge_card(self, uid, sessions):
+        candidate = latest_card_candidate(sessions)
+        if candidate and (candidate.get("end") or candidate.get("start") or 0) >= (time.time() - 7 * 86400) * 1000:
+            confirmed = candidate.get("price_status") == "confirmed"
+            text = ("本次充电费用已经记录。" if confirmed
+                    else "有一笔充电费用待确认，也可以直接回复“这次充电58元”。")
+            if append_charge_card_once(uid, text, candidate["id"]):
+                # 卡片真实落盘后再写提示标记；标记不再作为卡片存在性的依据。
+                mark_pending_notified(USERS_DIR, uid, candidate["id"])
+                return candidate
+        return None
+
+    def _api_charge_sessions(self, query):
+        """近 N 天充电账单（track_watcher 服务端记账；小程序关着也不漏，2026-10-25）。"""
+        s = self._auth()
+        if not s:
+            self._json(401, {"ok": False, "error": "未登录或会话过期"}); return
+        try:
+            days = max(0, min(3650, int(query.get("days", ["90"])[0])))
+        except Exception:
+            days = 90
+        cutoff = (time.time() - days * 86400) * 1000
+        acct = get_account(s["uid"])
+        vin = ((acct.get("vehicles") or [{}])[0].get("vin") or "")
+        out = self._charge_sessions_data(s["uid"], vin, cutoff if days else 0)
+        self._ensure_charge_card(s["uid"], out)
+        public = []
+        for item in out:
+            q = dict(item)
+            q.pop("latitude", None); q.pop("longitude", None); q.pop("vin", None)
+            q.pop("pending_notified", None); q.pop("pending_card_notified", None); q.pop("charge_card_v2_notified", None); q.pop("station_lookup_at", None)
+            public.append(q)
+        self._json(200, {"ok": True, "days": days, "sessions": public,
+                         "pending_count": sum(1 for q in out if q.get("price_status") == "pending")})
+
+    def _api_charge_session_update(self):
+        s = self._auth()
+        if not s:
+            self._json(401, {"ok": False, "error": "未登录或会话过期"}); return
+        data = self._parse_json() or {}
+        sid = str(data.get("id") or "").strip()
+        acct = get_account(s["uid"])
+        vin = ((acct.get("vehicles") or [{}])[0].get("vin") or "")
+        raw = read_sessions(USERS_DIR, s["uid"], vin, 0)
+        try:
+            confirm_session_cost(USERS_DIR, s["uid"], vin, raw, sid,
+                                 total_cost=data.get("total_cost"), unit_price=data.get("unit_price"),
+                                 remember=data.get("remember", True) is not False)
+        except (KeyError, ValueError, TypeError) as error:
+            self._json(400, {"ok": False, "error": str(error)}); return
+        session = next((q for q in decorate_sessions(USERS_DIR, s["uid"], vin, raw) if q["id"] == sid), None)
+        self._json(200, {"ok": True, "session": session})
+
     def _api_trip_detail(self, query):
         """单个行程详情 JSON（P 档结算数据：里程/用时/车速/电量/续航/温度/趋势）。"""
         s = self._auth()
@@ -2391,12 +2720,11 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             # 旧缓存地址升级：此前 regeo_name 只到市/区级（如「宝山区」），命中短地址就重算回写
             with open(fp, encoding="utf-8") as f:
                 dcache = json.load(f)
-            _short_addr = lambda a: (not str(a or '').strip()) or bool(re.search(r'\d{1,3}\.\d{3,}', str(a or ''))) or bool(re.fullmatch(r"[^市县区]{0,3}[市县区]", str(a or "")))   # 坐标串也算坏地址（2026-10-13）
-            if dcache.get("start_coord") and (_short_addr(dcache.get("start_addr")) or _short_addr(dcache.get("end_addr"))):
-                dcache["start_addr"] = regeo_name(dcache["start_coord"][0], dcache["start_coord"][1]) or dcache.get("start_addr")
-                dcache["end_addr"] = regeo_name(dcache["end_coord"][0], dcache["end_coord"][1]) or dcache.get("end_addr")
-                with open(fp, "w", encoding="utf-8") as f:
-                    json.dump(dcache, f, ensure_ascii=False)
+            import track_split as _ts_quality
+            if _ts_quality.repair_battery_power_detail(dcache):
+                _write_json_atomic(fp, dcache)
+            if refresh_trip_addresses(dcache, regeo_name):
+                _write_json_atomic(fp, dcache)
             # 旧缓存能量/电量字段补齐：早期即时补算只存了基础字段，有轨迹点就重算（2026-10-11）
             if ("consumed_kwh" not in dcache or "wh_per_km" not in dcache) and dcache.get("id"):   # 旧结算文件无净口径能耗也重算
                 try:
@@ -2416,6 +2744,8 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
                         break
                 except Exception:
                     pass
+            if _ts_quality.apply_sampling_quality(dcache):
+                _write_json_atomic(fp, dcache)
         except Exception:
             pass
         with open(fp, encoding="utf-8") as f:
@@ -2515,7 +2845,7 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
                         with urllib.request.urlopen(req, timeout=8) as resp:
                             data = resp.read(8 * 1024 * 1024 + 1)
                             ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].lower()
-                    if len(data) <= 8 * 1024 * 1024 and ctype.startswith("image/"):
+                    if len(data) > 10000 and len(data) <= 8 * 1024 * 1024 and ctype.startswith("image/"):
                         return data, ctype
                 except Exception:
                     pass
@@ -2747,16 +3077,53 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         if path == "/api/trip_detail":
             self._api_trip_detail(query)
             return
-        if path == "/api/trip_map":
-            self._api_trip_map(query)
-            return
         if path == "/api/trip_list":
             self._api_trip_list(query)
+            return
+        if path == "/api/charge_sessions":
+            self._api_charge_sessions(query)
+            return
+        if path == "/api/parking_sessions":
+            self._api_parking()
+            return
+        if path == "/api/weather":
+            s = self._auth()
+            if not s:
+                self._json(401, {"ok": False, "error": "请重新登录"}); return
+            acct = get_account(s['uid']) or {}
+            vin = ((acct.get('vehicles') or [{}])[0].get('vin') or '')
+            snapshot = self._read_telemetry_state(vin) or {}
+            fields = snapshot.get('fields') or {}
+            if fields.get('latitude') is None or fields.get('longitude') is None:
+                try:
+                    with open(os.path.join(user_dir(s['uid']), 'last_state.json'), encoding='utf-8') as source:
+                        fields = json.load(source).get('fields') or {}
+                except (OSError, ValueError):
+                    fields = {}
+            self._json(200, dict(ok=True, **weather_for_fields(fields)))
+            return
+        if path == "/api/trip_map":
+            self._api_trip_map(query)
             return
         if path == "/test-trip.html":
             self._serve_file("test-trip.html", "text/html; charset=utf-8")
             return
         if path == "/test/trip_detail_latest.json":
+            self._serve_file("test/trip_detail_latest.json", "application/json; charset=utf-8")
+            return
+        if path == "/test/trip-filter-ab.html":
+            self._serve_file("test/trip-filter-ab.html", "text/html; charset=utf-8")
+            return
+        if path == "/test/trip-revamp.html":
+            self._serve_file("test/trip-revamp.html", "text/html; charset=utf-8")
+            return
+        if path == "/test/trip-compact.html":
+            self._serve_file("test/trip-compact.html", "text/html; charset=utf-8")
+            return
+            self._serve_file("test/trip-revamp.html", "text/html; charset=utf-8")
+            return
+            self._serve_file("test/trip-filter-ab.html", "text/html; charset=utf-8")
+            return
             self._serve_file("test/trip_detail_latest.json", "application/json; charset=utf-8")
             return
         if path == "/api/trips":
@@ -2776,7 +3143,8 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._oauth_callback(query)
             return
         if path == "/api/health":
-            self._json(200, {"ok": True, "ts": now_iso()})
+            self._json(200, {"ok": True, "ts": now_iso(),
+                             "realtime_ready": bool(_telemetry_notify_ready)})
             return
         if path == "/api/wrap/templates":
             self._api_wrap_templates()
@@ -2881,6 +3249,10 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._api_bind()
         elif path == "/api/chat":
             self._api_chat()
+        elif path == "/api/parking_session/update":
+            self._api_parking(update=True)
+        elif path == "/api/charge_session/update":
+            self._api_charge_session_update()
         elif path == "/api/control/probe":
             self._api_control_probe()
         elif path == "/api/route":
@@ -2913,6 +3285,8 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._api_monitor_cleanup()
         elif path == "/api/monitor/unbind":
             self._api_monitor_unbind()
+        elif path == "/internal/wxmsg":
+            self._internal_wxmsg()
         elif path == "/api/mp/login":
             self._api_mp_login()
         else:
@@ -2949,6 +3323,84 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             return ""
 
     # ---- 小程序登录（骨架，2026-10-04 预埋；凭据走环境变量 MP_WX_APPID/MP_WX_SECRET）----
+    # ---- 订阅消息（微信小程序 2026-10-24）----
+    _wxmsg_token = {"tok": "", "ts": 0}
+
+    def _wxmsg_access_token(self):
+        """小程序全局 access_token，7200s 有效，进程内缓存 7000s。失败返回 None。"""
+        now = time.time()
+        if _WXMSG_TOKEN["tok"] and now - _WXMSG_TOKEN["ts"] < 7000:
+            return _WXMSG_TOKEN["tok"]
+        if not (MP_WX_APPID and MP_WX_SECRET):
+            return None
+        try:
+            u = ("https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential"
+                 "&appid=%s&secret=%s" % (MP_WX_APPID, MP_WX_SECRET))
+            with urllib.request.urlopen(u, timeout=8) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            tok = d.get("access_token")
+            if tok:
+                _WXMSG_TOKEN["tok"] = tok; _WXMSG_TOKEN["ts"] = now
+                return tok
+            log_line("wxmsg", f"token 失败: {d}")
+        except Exception as e:
+            log_line("wxmsg", f"token 异常: {e}")
+        return None
+
+    def send_subscribe_msg(self, openid, template_id, data, page=None):
+        """发一条订阅消息。data 结构：{"key1": {"value": "v1"}, ...}。成功 True。"""
+        tok = self._wxmsg_access_token()
+        if not tok:
+            return False
+        payload = {"touser": openid, "template_id": template_id, "data": data}
+        if page:
+            payload["page"] = page
+        try:
+            req = urllib.request.Request(
+                "https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token=" + tok,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            if d.get("errcode") == 0:
+                return True
+            # 43101=用户未订阅/已拒收：静默；其他记日志
+            log_line("wxmsg", f"发送失败 openid={openid[:8]}… err={d.get('errcode')} {d.get('errmsg')}")
+            return False
+        except Exception as e:
+            log_line("wxmsg", f"发送异常: {e}")
+            return False
+
+    def _internal_wxmsg(self):
+        """内部接口：track_watcher/digest 行程完成与周报推送订阅消息（仅 127.0.0.1）。
+        body: {"uid": "...", "title": "行程完成", "value": "12.3 km · 25 分钟", "page": "pages/home/home"}"""
+        if not self.client_address or not str(self.client_address[0]).startswith("127."):
+            self._json(403, {"ok": False});
+            return
+        data = self._parse_json() or {}
+        uid = str(data.get("uid") or "")
+        title = str(data.get("title") or "通知")
+        value = str(data.get("value") or "")
+        page = data.get("page") or "pages/home/home"
+        if not uid:
+            self._json(400, {"ok": False, "error": "missing uid"});
+            return
+        try:
+            codes = load_codes()
+            openid = (codes.get(uid) or {}).get("openid") or ""
+        except Exception:
+            openid = ""
+        if not openid:
+            self._json(200, {"ok": True, "sent": False, "reason": "no openid"});
+            return
+        now_s = datetime.now().strftime("%m月%d日 %H:%M")
+        sent = self.send_subscribe_msg(openid, WXMSG_TRIP_TMPL, {
+            "thing1": {"value": title[:20]},
+            "thing2": {"value": value[:20]},
+            "time3": {"value": now_s},
+        }, page)
+        self._json(200, {"ok": True, "sent": bool(sent)})
+
     def _api_mp_login(self):
         """wx.login 的 code 换 openid 并落到 uid。未配置 AppID/Secret 时为 mock 模式：
         用 code 派生伪 openid，供小程序壳无凭据联调；配置后自动走 code2session 真换。
@@ -2988,6 +3440,13 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             codes[uid] = {"name": "小程序用户 " + uid[-4:], "enabled": True}
             save_codes(codes)
             log_line("mplogin", f"新建小程序用户档案: {uid}")
+        # 订阅消息依赖：openid 落档案（与邮箱 uid 关联后可按邮箱身份发）
+        if not is_mock:
+            try:
+                codes[uid]["openid"] = openid
+                save_codes(codes)
+            except Exception:
+                pass
         log_line("mplogin", f"小程序登录: {uid} mock={is_mock}")
         self._json(200, {"ok": True, "uid": uid, "mock": is_mock})
 
@@ -3062,7 +3521,7 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 _disk = json.load(f)
-            if _disk.get("items") and now - _disk.get("ts", 0) < 86400:
+            if _disk.get("items") and now - _disk.get("ts", 0) < 7 * 86400:   # 素材列表变化慢，7 天内直接用
                 _skin_cache = [_disk.get("ts", now), _disk["items"]]
                 self._json(200, {"ok": True, "items": _skin_cache[1]})
                 return
@@ -3072,7 +3531,7 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             req = urllib.request.Request("https://www.tesla-skin.com/api/skins?limit=300", headers={
                 "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
                 "Accept": "application/json", "Referer": "https://www.tesla-skin.com/"})
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:   # 403/挂起时快速失败回退盘缓存（2026-10-24 素材加载超时根因）
                 d = json.loads(resp.read().decode("utf-8", errors="replace"))
         except Exception as e:
             # 网络失败：有旧盘缓存就用旧的
@@ -3383,8 +3842,8 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
 
     def _api_control_probe(self):
         """探测控制授权（虚拟钥匙）状态。POST /api/control/probe。
-        已 ready → 快速返回不用醒车；否则调 user_runner 无损 door_lock 探针归类。
-        """
+        2026-10-26：本接口只读缓存，绝不发 door_lock 探针（指令必唤醒车，违反"驻车零打扰"）。
+        未配对的判定交给真实指令的失败兜底（check_pair_after_failure），用户点了车控自然会学到。"""
         s = self._auth()
         if not s:
             self._json(401, {"ok": False, "error": "未登录或会话过期"}); return
@@ -3398,16 +3857,13 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
         if pair_cache_ready(uid):
             self._json(200, {"ok": True, "bound": True, "ready": True, "needs_pairing": False,
                              "state": "ready", "vin": vin, "pair_url": PAIR_URL}); return
-        ready, needs = probe_user_pairing(uid)
-        if ready:
-            self._json(200, {"ok": True, "bound": True, "ready": True, "needs_pairing": False,
-                             "state": "ready", "vin": vin, "pair_url": PAIR_URL}); return
-        if needs:
+        st = get_pair_state(uid) or {}
+        if st.get("control_ready") is False and st.get("ts"):
             self._json(200, {"ok": True, "bound": True, "ready": False, "needs_pairing": True,
                              "state": "needs_pairing", "vin": vin, "pair_url": PAIR_URL}); return
         self._json(200, {"ok": True, "bound": True, "ready": False, "needs_pairing": False,
                          "state": "unknown", "vin": vin, "pair_url": PAIR_URL,
-                         "hint": "车离线或正在唤醒，暂无法判定；稍后可重试"})
+                         "hint": "尚未探测配对状态；首次车控时会自动判定"})
 
     # ---- 选车绑定 ----
     def _api_bind(self):
@@ -3450,6 +3906,21 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
         self._json(200, {"ok": True, "vehicle": target})
 
     # ---- 语音转写 ----
+    def _api_parking(self, update=False):
+        s = self._auth()
+        if not s:
+            self._json(401, {"ok": False, "error": "请重新登录"}); return
+        try:
+            if update:
+                data = self._parse_json() or {}
+                parking_ledger.update(USERS_DIR, s['uid'], str(data.get('id') or ''),
+                                      data.get('cost'), data.get('home'), data.get('name'),
+                                      data.get('start'), data.get('end'), data.get('remember', True),
+                                      data.get('separate', False))
+            self._json(200, {"ok": True, "sessions": parking_ledger.sessions(USERS_DIR, s['uid'])})
+        except (ValueError, TypeError) as error:
+            self._json(400, {"ok": False, "error": str(error)})
+
     def _api_transcribe(self):
         """接收浏览器上传的音频（webm/ogg/wav），调 whisper 转写返回文本。"""
         s = self._auth()
@@ -3485,8 +3956,8 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                 os.remove(tmp)
             except Exception:
                 pass
-        if not text:
-            self._json(200, {"ok": False, "text": "", "error": "转写失败（whisper 服务不可用）"})
+        if is_empty_voice_transcript(text):
+            self._json(200, {"ok": False, "text": "", "error": "未识别到文字"})
             return
         log_line("transcribe", f"{s['name']}: 语音={text}")
         self._json(200, {"ok": True, "text": text})
@@ -3511,6 +3982,27 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
         if len(text) > MAX_TEXT:
             self._json(400, {"ok": False, "error": "消息太长"})
             return
+        charge_cost = parse_charge_cost_text(text)
+        if charge_cost is not None:
+            acct = get_account(s["uid"])
+            vin = ((acct.get("vehicles") or [{}])[0].get("vin") or "")
+            raw = read_sessions(USERS_DIR, s["uid"], vin, 0)
+            sessions = decorate_sessions(USERS_DIR, s["uid"], vin, raw)
+            pending = latest_pending(sessions)
+            if not pending:
+                reply = "没有找到待确认费用的充电记录。充电结束后我会自动记录并提醒你。"
+            else:
+                try:
+                    confirm_session_cost(USERS_DIR, s["uid"], vin, raw, pending["id"], total_cost=charge_cost)
+                    unit = charge_cost / max(float(pending.get("kwh") or 0), 0.001)
+                    station = pending.get("station_name") or "本次充电"
+                    reply = "已记录：%s %.2f kWh，实付 %.2f 元，综合单价 %.2f 元/kWh。%s" % (
+                        station, float(pending.get("kwh") or 0), charge_cost, unit,
+                        "下次到这个站会自动沿用参考价。" if pending.get("station_key") else "暂未识别到站点，本次费用已保存。")
+                except (KeyError, ValueError, TypeError) as error:
+                    reply = "这笔费用暂时没记上：%s" % error
+            append_chat(s["uid"], "me", text); append_chat(s["uid"], "car", reply)
+            self._json(200, {"ok": True, "reply": reply, "charge_cost_recorded": bool(pending)}); return
         # 口语归一：了尾/倒序说法改写为规范说法再进解析（问句/否定句原样）
         text = _canon_cmd(text)
         # 解绑咨询（关键词直达，先于绑定检查：未绑定时也给出正确答复）
@@ -3893,7 +4385,29 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
         s = self._auth()
         if not s:
             self._json(401, {"ok": False, "error": "未登录或会话过期"}); return
-        messages = load_chat(s["uid"])
+        acct = get_account(s["uid"])
+        vin = ((acct.get("vehicles") or [{}])[0].get("vin") or "")
+        cutoff = (time.time() - 90 * 86400) * 1000
+        recent = self._charge_sessions_data(s["uid"], vin, cutoff, match_station=False)
+        prompted = self._ensure_charge_card(s["uid"], recent)
+        if prompted and not prompted.get("station_name"):
+            threading.Thread(target=self._charge_sessions_data,
+                             args=(s["uid"], vin, cutoff), daemon=True).start()
+        messages = hydrate_trip_chat_cards(s["uid"], visible_chat_messages(load_chat(s["uid"])))
+        charge_ids = {str((m.get("card") or {}).get("session_id") or "") for m in messages
+                      if isinstance(m, dict) and (m.get("card") or {}).get("type") == "charge_cost"}
+        if charge_ids:
+            sessions = recent
+            if any(sid not in {q.get("id") for q in recent} for sid in charge_ids):
+                sessions = decorate_sessions(USERS_DIR, s["uid"], vin,
+                                             read_sessions(USERS_DIR, s["uid"], vin, 0))
+            by_id = {q["id"]: q for q in sessions if q.get("id") in charge_ids}
+            for message in messages:
+                card = message.get("card") if isinstance(message, dict) else None
+                session = by_id.get(str((card or {}).get("session_id") or ""))
+                if not session:
+                    continue
+                message["card"] = charge_cost_card(session)
         self._json(200, {"ok": True, "messages": messages})
 
     def _api_scenarios_get(self):
@@ -4468,17 +4982,17 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
             with open(telemetry_file, encoding="utf-8") as f:
                 data = json.load(f)
             # 转换为 last_state.json 格式
-            fields = data.get("fields", {})
-            # 遥测字段映射：hvac_power -> is_climate_on
-            is_climate_on = fields.get("hvac_power") not in (None, "HvacPowerStateOff", "")
-            fields["is_climate_on"] = is_climate_on
+            fields = normalize_measurements(data.get("fields") or {}, data.get("field_ts") or {})
+            # 空调枚举/布尔已由 normalize_measurements 统一处理；缺失不伪造关闭。
             # 充电状态映射：优先用采集端功率推导的 charging（cn 固件直流快充 ChargeState 仍 Idle）
             if fields.get("charging") is None:
                 fields["charging"] = fields.get("charging_state") in ("Charging", "Starting")
             # 在线状态：有最近更新视为在线
             last_update = data.get("last_update", 0)
             fields["online"] = (time.time() - last_update) < 300  # 5分钟内视为在线
-            return {"fields": fields, "ts": last_update}
+            return {"fields": fields, "ts": last_update,
+                    "vehicle_ts": data.get("vehicle_ts"),
+                    "ingest_ts": data.get("ingest_ts") or last_update}
         except Exception:
             return None
 
@@ -4488,7 +5002,9 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
         if not (telemetry and telemetry.get("ts") and (time.time() - telemetry["ts"]) < 30):
             return None
         fields = telemetry.get("fields", {})
-        fields["_frame_ts"] = telemetry.get("ts")   # 帧采集时间：location_ts 用它（稳定），否则SSE签名每2s抖动重推=第四屏狂跳（2026-10-11）
+        fields["_frame_ts"] = telemetry.get("vehicle_ts") or telemetry.get("ts")
+        fields["_vehicle_ts"] = telemetry.get("vehicle_ts")
+        fields["_ingest_ts"] = telemetry.get("ingest_ts") or telemetry.get("ts")
         return _fields_to_text(fields), fields
 
     def _probe_state(self, uid):
@@ -4511,12 +5027,15 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")   # 禁 nginx 缓冲事件流:否则推送被攒包,延迟数秒(2026-10-28)
             self.end_headers()
         except Exception:
             return
         log_line("stream", f"{s['name']} SSE 连接建立")
         last_sig = None
         last_ping = time.time()
+        with _telemetry_condition:
+            seen_telemetry_version = _telemetry_versions.get(vin, 0)
         # 注册到广播表：唤醒观察者/job 事件可主动推给这条连接
         with _sse_lock:
             _sse_clients.setdefault(s["uid"], []).append(self)
@@ -4525,21 +5044,34 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                 now = time.time()
                 frame = self._telemetry_frame(vin)
                 if frame:
+                    state_meta = build_state_meta(frame[1], "telemetry", True)
                     fields = _inject_meta_fields(vin, frame[1])   # SSE 帧与 /api/state 同一套档案注入（胎压/定位兜底）
                     sig = _state_sig(fields)   # 显示敏感度去重：温度微抖/坐标漂移/帧时间戳不再触发重推
                     if sig != last_sig:
                         last_sig = sig
-                        last_ping = now
                         payload = json.dumps(
-                            {"type": "state", "state": frame[0], "vehicle_data": fields},
+                            {"type": "state", "state": frame[0], "vehicle_data": fields,
+                             "state_meta": state_meta},
                             ensure_ascii=False)
                         self.wfile.write(("data: " + payload + "\n\n").encode("utf-8"))
                         self.wfile.flush()
-                elif now - last_ping > 15:
+                        _log_state_diag(s["uid"], "sse", state_meta)
+                # 心跳无条件每15s一跳(2026-10-28):此前只在无数据帧时才发,驻车静止时连接
+                # 被代理空闲超时掐断,重连间隙=用户看到的"几秒延迟"
+                if now - last_ping > 15:
                     last_ping = now
                     self.wfile.write(b'data: {"type":"ping"}\n\n')
                     self.wfile.flush()
-                time.sleep(2)
+                # ingest 原子写完快照后会发本机通知；有变化立即醒。
+                # UDP 仅负责“叫醒”，丢包不会损坏状态；即使监听正常也每2秒兜底读取，
+                # 避免 ingest 部署路径/进程异常时退化成15秒可见延迟。15秒仍只负责心跳。
+                heartbeat_wait = max(0.05, 15 - (time.time() - last_ping))
+                fallback_wait = TELEMETRY_NOTIFY_FALLBACK_SECONDS if _telemetry_notify_ready else 0.5
+                wait_seconds = min(fallback_wait, heartbeat_wait)
+                with _telemetry_condition:
+                    if _telemetry_versions.get(vin, 0) == seen_telemetry_version:
+                        _telemetry_condition.wait(timeout=wait_seconds)
+                    seen_telemetry_version = _telemetry_versions.get(vin, 0)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         except Exception as e:
@@ -4586,16 +5118,76 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
             except Exception:
                 return None
 
-        def _reply(text_state, fields, fresh):
+        def _reply(text_state, fields, fresh, source="unknown", source_ts=None, ingest_ts=None):
+            state_meta = build_state_meta(fields, source, fresh, source_ts, ingest_ts)
             fields = _inject_meta_fields(vin_full, fields)
-            self._json(200, {"ok": True, "state": text_state, "vehicle_data": fields, "fresh": fresh})
+            # 天气文案随车况下发（前端雨/雪动效；失败静默 2026-10-24）
+            _wx_txt = weather_for_fields(fields)['weather']
+            self._json(200, {"ok": True, "state": text_state, "vehicle_data": fields,
+                             "fresh": fresh, "weather": _wx_txt, "state_meta": state_meta})
+            _log_state_diag(uid, "rest", state_meta)
+
+        # 数据源竞争(2026-10-28):遥测流断供时(如授权缺位置权限被特斯拉整体拒),
+        # 遥测快照会冻结多日(415km 旧续航事故)——按时间戳取更新的一方,不再盲信遥测优先
+        def _src_newer(_tele, last_json):
+            try:
+                tts = float(_tele.get("ts") or 0)
+            except Exception:
+                tts = 0
+            try:
+                lts = float((last_json or {}).get("ts") or 0)
+            except Exception:
+                lts = 0
+            if not lts:
+                try:
+                    lts = os.path.getmtime(json_file)
+                except Exception:
+                    lts = 0
+            return tts >= lts
 
         # 0) 优先使用遥测数据（最实时，不消耗API配额）；指令后直连窗口内跳过——
         # 后备箱等字段遥测不推，窗口内必须直连全量快照才能确认执行结果（2026-10-11）
         vin_full = (acct.get("vehicles") or [{}])[0].get("vin", "")
+        # quiet=1（后台轮询，2026-10-26 重建）：绝不触碰车辆——不发探测、不拉 vehicle_data，
+        # 只回遥测帧（新鲜）或最后已知值。小程序后台轮询/天气轮询专用，驻车不骚扰。
+        if (_q.get("quiet") or ["0"])[0] == "1":
+            frame = self._telemetry_frame(vin_full)
+            if frame:
+                _reply(frame[0], frame[1], True, "telemetry")
+                return
+            _tele = self._read_telemetry_state(vin_full)
+            last_json = _read_last_json()
+            # 谁新用谁:遥测流断供时不把冻结多日的快照当真相
+            if _tele and _tele.get("fields") and _src_newer(_tele, last_json):
+                tf = dict(_tele.get("fields") or {})
+                tf["_frame_ts"] = _tele.get("vehicle_ts") or _tele.get("ts")
+                tf["_vehicle_ts"] = _tele.get("vehicle_ts")
+                tf["_ingest_ts"] = _tele.get("ingest_ts") or _tele.get("ts")
+                try:
+                    if time.time() - float(_tele.get("ts") or 0) > 1800:
+                        tf["_stale"] = True
+                except Exception:
+                    pass
+                txt2 = re.sub(r"状态\s*\S+", "状态 离线", _fields_to_text(tf))
+                _reply(txt2, tf, False, "telemetry_last")
+                return
+            last_text = _read_last_text()
+            # 状态改写为离线仅当缓存也陈旧(>5分钟);last_state 新鲜(采集器刚成功)则保留真实状态
+            lt2 = last_text or "状态 离线"
+            try:
+                lts = float((last_json or {}).get("ts") or 0)
+                if not lts:
+                    lts = os.path.getmtime(json_file)
+                if last_text and time.time() - lts > 300:
+                    lt2 = re.sub(r"状态\s*\S+", "状态 离线", last_text)
+            except Exception:
+                pass
+            _reply(lt2, (last_json or {}).get("fields") if last_json else None,
+                   False, "last_state", lts if 'lts' in locals() else None)
+            return
         frame = None if time.time() < _ST_FPOLL.get(uid, 0) else self._telemetry_frame(vin_full)
         if frame:
-            _reply(frame[0], frame[1], True)
+            _reply(frame[0], frame[1], True, "telemetry")
             return
 
         # 1) 先不唤醒探测：只读车辆元数据（state 字段）
@@ -4607,9 +5199,13 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                 # [fix 2026-09-26] 优先用遥测"最后上报值"：车端主动推送、零配额零唤醒，
                 # 字段比 last_state 文本快照新鲜齐全（电量/温度/锁闭/空调态）
                 _tele = self._read_telemetry_state(vin_full)
-                if _tele and _tele.get("fields"):
+                last_json = _read_last_json()
+                # 谁新用谁(2026-10-28):遥测流断供时不展示冻结多日的快照(415km 旧续航事故)
+                if _tele and _tele.get("fields") and _src_newer(_tele, last_json):
                     tf = dict(_tele.get("fields") or {})
-                    tf["_frame_ts"] = _tele.get("ts")   # 帧采集时间：位置时间戳用它，而不是响应时间
+                    tf["_frame_ts"] = _tele.get("vehicle_ts") or _tele.get("ts")
+                    tf["_vehicle_ts"] = _tele.get("vehicle_ts")
+                    tf["_ingest_ts"] = _tele.get("ingest_ts") or _tele.get("ts")
                     # 2026-10-07 用户定版：离线/休眠时显示最后已知车控状态（同特斯拉 App），
                     # 不再剥离置 --；_stale 仅作标记不改变显示
                     try:
@@ -4618,7 +5214,7 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                     except Exception:
                         pass
                     txt2 = re.sub(r"状态\s*在线", f"状态 {cn}", _fields_to_text(tf))
-                    _reply(txt2, tf, False)
+                    _reply(txt2, tf, False, "telemetry_last")
                     return
                 last_text = _read_last_text()
                 if last_text:
@@ -4642,7 +5238,7 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                         fields["_stale"] = True
                 except Exception:
                     pass
-                _reply(new_state, fields, False)
+                _reply(new_state, fields, False, "last_state", _ts if '_ts' in locals() else None)
                 return
 
         # 1.5) 进程内 30s 缓存：车控命令执行后会失效，命中则零开销返回
@@ -4650,7 +5246,8 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
         ent = _st_cache.get(uid)
         _ttl = 5 if time.time() < _ST_FPOLL.get(uid, 0) else _ST_CACHE_TTL
         if ent and (time.time() - ent["ts"]) < _ttl:
-            _reply(_fields_to_text(ent["fields"]), ent["fields"], True)
+            _reply(_fields_to_text(ent["fields"]), ent["fields"], True,
+                   "memory_cache", ent["ts"], ent["ts"])
             return
 
         # 2) 在线/未知：进程内直连拉结构化车况（无子进程冷启动），持久化快照
@@ -4667,7 +5264,8 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                     f.write(_fields_to_text(fields))
             except Exception:
                 pass
-            _reply(_fields_to_text(fields), fields, True)
+            _now = time.time()
+            _reply(_fields_to_text(fields), fields, True, "fleet_api", _now, _now)
             return
 
         # 2b) 直连失败（典型：token 过期，子进程链路可自愈刷新）→ 旧子进程链路兜底
@@ -4697,7 +5295,8 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                 cs = fields.get("charging_state")
                 if cs:
                     txt += f"\n充电 {cs}"
-                _reply(txt, fields, True)
+                _now = time.time()
+                _reply(txt, fields, True, "runner", _now, _now)
                 return
             self._json(200, {"ok": False, "state": ""})
             return
@@ -4706,7 +5305,8 @@ a{{display:inline-block;background:#07c160;color:#fff;text-decoration:none;paddi
                 f.write(out)
         except Exception:
             pass
-        _reply(out, fields, bool(fields))
+        _now = time.time()
+        _reply(out, fields, bool(fields), "runner", _now, _now)
 
 def main():
     ensure_codes_file()
@@ -4727,6 +5327,7 @@ def main():
         except Exception as e:
             print(f"[startup] 高德 Key 校验失败：{e}")
     schedule.start_scheduler()
+    _start_telemetry_notify_listener()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     log_line("start", f"multi car-web 启动: http://{HOST}:{PORT}")
     print(f"multi car-web listening on http://{HOST}:{PORT}")
