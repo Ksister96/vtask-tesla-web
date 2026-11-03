@@ -3,11 +3,34 @@
 
 输入轨迹点：{"ts": 毫秒, "lat": 纬度, "lon": 经度, "spd": km/h|None, "gear": "P/D/R/N"|None, "odo": 公里}
 规则（docs/行驶回顾功能方案_20261005.md §4.2）：
-- gear P(None 视同 P)↔D/R 切换切段；相邻点间隔 >20 分钟切段；跨天切段
+- 明确 P 档停车超过3分钟或轨迹不连续才切段；未知档位不视作停车
+- 相邻点间隔 >20 分钟切段；跨天切段
 - 行程 = 连续非 P 的点 ≥2 个；里程 = 末 odo − 首 odo（公里）
 - downsample：等距抽稀到 ≤n 点，保留首末点
 """
 from datetime import datetime
+import math
+import statistics
+
+
+ENERGY_SIGN_VERSION = 2
+
+
+def can_resume(stop, point):
+    """Resume only a short, spatially continuous stop; never join across midnight."""
+    dt = point["ts"] - stop["ts"]
+    if not 0 <= dt < 180000:
+        return False
+    if datetime.fromtimestamp(stop["ts"] / 1000).date() != datetime.fromtimestamp(point["ts"] / 1000).date():
+        return False
+    if stop.get("odo") is None or point.get("odo") is None or not 0 <= point["odo"] - stop["odo"] <= 0.5:
+        return False
+    try:
+        dy = (point["lat"] - stop["lat"]) * 111320
+        dx = (point["lon"] - stop["lon"]) * 111320 * math.cos(math.radians(stop["lat"]))
+        return math.hypot(dx, dy) <= 500
+    except (KeyError, TypeError):
+        return False
 
 
 def split_trips(points, gap_min=20):
@@ -15,9 +38,10 @@ def split_trips(points, gap_min=20):
     pts.sort(key=lambda q: q["ts"])
     trips = []
     cur = []
+    stop = None
 
     def flush():
-        moving = [q for q in cur if q.get("gear") not in (None, "P")]
+        moving = [q for q in cur if q.get("gear") in ("D", "R", "N") or (q.get("spd") or 0) > 1]
         if len(moving) < 2:
             return
         o0, o1 = moving[0].get("odo"), moving[-1].get("odo")
@@ -43,14 +67,16 @@ def split_trips(points, gap_min=20):
         if gap or cross_day:
             flush()
             cur = [p]
-        elif prev.get("gear") in (None, "P") and p.get("gear") not in (None, "P"):
-            flush()
-            cur = [p]
-        elif prev.get("gear") not in (None, "P") and p.get("gear") in (None, "P"):
-            cur.append(p)
-            flush()
-            cur = []
+            stop = None
         else:
+            moving = p.get("gear") in ("D", "R", "N") or (p.get("spd") or 0) > 1
+            if moving and stop:
+                if not can_resume(stop, p):
+                    flush()
+                    cur = []
+                stop = None
+            elif not moving and p.get("gear") == "P":
+                stop = stop or p
             cur.append(p)
     flush()
     return trips
@@ -66,6 +92,96 @@ def downsample(pts, n=100):
     return out
 
 
+def apply_sampling_quality(detail, expected_interval_s=1.0):
+    """Attach sampling quality while retaining the recorded speed peak.
+
+    coverage counts at most two expected intervals per gap. Long gaps therefore
+    lower the score instead of being mistaken for continuously observed time.
+    """
+    keys = ("sample_interval_median_s", "sample_interval_p95_s", "sample_gap_max_s",
+            "sample_coverage_pct", "speed_sample_points", "power_sample_points",
+            "max_kmh_sampled", "max_kmh_reliable", "max_kmh")
+    before = {key: detail.get(key) for key in keys}
+    speed = [point for point in (detail.get("speed_series") or [])
+             if isinstance(point, (list, tuple)) and len(point) >= 2
+             and isinstance(point[0], (int, float)) and isinstance(point[1], (int, float))]
+    power = [point for point in (detail.get("power_series") or [])
+             if isinstance(point, (list, tuple)) and len(point) >= 2 and point[1] is not None]
+    speed.sort(key=lambda point: point[0])
+    gaps = [max(0.0, (speed[i][0] - speed[i - 1][0]) / 1000.0)
+            for i in range(1, len(speed)) if speed[i][0] > speed[i - 1][0]]
+    duration_s = (speed[-1][0] - speed[0][0]) / 1000.0 if len(speed) >= 2 else 0.0
+    median_gap = statistics.median(gaps) if gaps else None
+    ordered = sorted(gaps)
+    p95_gap = ordered[int((len(ordered) - 1) * 0.95)] if ordered else None
+    max_gap = max(gaps) if gaps else None
+    observed_s = sum(min(gap, expected_interval_s * 2) for gap in gaps)
+    coverage = min(100.0, observed_s / duration_s * 100) if duration_s > 0 else 0.0
+    sampled_max = round(max((point[1] for point in speed)), 1) if speed else None
+    reliable = bool(len(speed) >= 3 and coverage >= 80 and p95_gap is not None
+                    and p95_gap <= expected_interval_s * 3)
+    detail.update({
+        "sample_interval_median_s": round(median_gap, 2) if median_gap is not None else None,
+        "sample_interval_p95_s": round(p95_gap, 2) if p95_gap is not None else None,
+        "sample_gap_max_s": round(max_gap, 2) if max_gap is not None else None,
+        "sample_coverage_pct": round(coverage, 1),
+        "speed_sample_points": len(speed),
+        "power_sample_points": len(power),
+        "max_kmh_sampled": sampled_max,
+        "max_kmh_reliable": reliable,
+        "max_kmh": sampled_max,
+    })
+    return any(before[key] != detail.get(key) for key in keys)
+
+
+def _energy_metrics(power_series, distance_km):
+    """按“正数=放电、负数=回收”的统一口径积分功率序列。"""
+    kwh_pos = kwh_neg = 0.0
+    for a, b in zip(power_series, power_series[1:]):
+        if not (isinstance(a, (list, tuple)) and isinstance(b, (list, tuple))
+                and len(a) >= 2 and len(b) >= 2):
+            continue
+        try:
+            dt_h = min(max(0.0, (float(b[0]) - float(a[0])) / 3600000.0), 60 / 3600.0)
+            power = float(a[1])
+        except (TypeError, ValueError):
+            continue
+        if power > 0:
+            kwh_pos += power * dt_h
+        else:
+            kwh_neg += -power * dt_h
+    out = {"consumed_kwh": round(kwh_pos, 2), "regen_kwh": round(kwh_neg, 2)}
+    if distance_km and distance_km > 0.3 and kwh_pos > 0.02:
+        out["wh_per_km"] = round(max(0.0, kwh_pos - kwh_neg) * 1000 / distance_km)
+    if kwh_pos > 0.02 and kwh_neg > 0.01:
+        out["regen_rate"] = round(kwh_neg / kwh_pos * 100, 1)
+    return out
+
+
+def repair_battery_power_detail(detail):
+    """迁移旧行程：Tesla PackCurrent 负数是放电，旧版曾反向解释。"""
+    if (not isinstance(detail, dict) or detail.get("power_source") != "battery"
+            or int(detail.get("energy_sign_version") or 0) >= ENERGY_SIGN_VERSION):
+        return False
+    repaired = []
+    for point in detail.get("power_series") or []:
+        if not isinstance(point, (list, tuple)) or len(point) < 2 or point[1] is None:
+            continue
+        try:
+            repaired.append([point[0], -float(point[1])])
+        except (TypeError, ValueError):
+            continue
+    if len(repaired) < 2:
+        return False
+    detail["power_series"] = repaired
+    for key in ("consumed_kwh", "regen_kwh", "wh_per_km", "regen_rate"):
+        detail.pop(key, None)
+    detail.update(_energy_metrics(repaired, detail.get("distance_km")))
+    detail["energy_sign_version"] = ENERGY_SIGN_VERSION
+    apply_sampling_quality(detail)
+    return True
+
+
 def build_detail(mv, tid=None):
     """行驶点序列 → 行程详情 dict（track_watcher P档结算 与 trip_detail 即时补算 共用，字段必须一致 2026-10-11）。
     mv: 已过滤行驶点（gear D/R/N 或 spd>1），≥2 点。
@@ -76,7 +192,6 @@ def build_detail(mv, tid=None):
     o0, o1 = mv[0].get("odo"), mv[-1].get("odo")
     dist = round(o1 - o0, 2) if (o0 is not None and o1 is not None) else None
     dur_s = (mv[-1]["ts"] - mv[0]["ts"]) / 1000.0
-    spds = [p.get("spd") for p in mv if p.get("spd") is not None]
     t0 = _t.localtime(mv[0]["ts"] / 1000)
     t1 = _t.localtime(mv[-1]["ts"] / 1000)
     d = {
@@ -87,7 +202,6 @@ def build_detail(mv, tid=None):
         "duration_min": round(dur_s / 60),
         "distance_km": dist,
         "avg_kmh": round(dist / (dur_s / 3600.0), 1) if (dist and dur_s > 60) else None,
-        "max_kmh": round(max(spds), 1) if spds else None,
         "start_coord": [mv[0]["lat"], mv[0]["lon"]],
         "end_coord": [mv[-1]["lat"], mv[-1]["lon"]],
         "speed_series": [[p["ts"], p.get("spd")] for p in mv if p.get("spd") is not None],
@@ -109,59 +223,12 @@ def build_detail(mv, tid=None):
     if touts:
         d["outside_temp_avg"] = round(sum(touts) / len(touts), 1)
     pwrs = [p for p in mv if p.get("pwr") is not None]
-    if len(pwrs) >= 2:
-        kwh_pos = kwh_neg = 0.0
-        for a, b in zip(pwrs, pwrs[1:]):
-            dt_h = min((b["ts"] - a["ts"]) / 3600000.0, 60 / 3600.0)
-            if a["pwr"] > 0:
-                kwh_pos += a["pwr"] * dt_h
-            else:
-                kwh_neg += -a["pwr"] * dt_h
-        d["consumed_kwh"] = round(kwh_pos, 2)
-        d["regen_kwh"] = round(kwh_neg, 2)
-        if dist and dist > 0.3 and kwh_pos > 0.02:
-            d["wh_per_km"] = round(max(0.0, kwh_pos - kwh_neg) * 1000 / dist)
-        if kwh_pos > 0.02 and kwh_neg > 0.01:
-            d["regen_rate"] = round(kwh_neg / kwh_pos * 100, 1)
-    d["power_series"] = [[p["ts"], p.get("pwr")] for p in mv if p.get("pwr") is not None]
+    d["power_series"] = [[p["ts"], -p["pwr"] if p.get("power_source") == "battery" else p["pwr"]]
+                         for p in pwrs]
+    if len(d["power_series"]) >= 2:
+        d.update(_energy_metrics(d["power_series"], dist))
+    if any(p.get("power_source") == "battery" for p in pwrs):
+        d["power_source"] = "battery"
+        d["energy_sign_version"] = ENERGY_SIGN_VERSION
+    apply_sampling_quality(d)
     return d
-
-
-def repair_battery_power_detail(d):
-    """就地补齐旧结算文件缺失的能耗字段（有 power_series 即可重算）。
-
-    与 build_detail 口径一致：consumed_kwh=放电毛量，regen_kwh=回收，
-    wh_per_km=净消耗/里程；采样缺口>60s 按 60s 计。返回是否改写了 dict。
-    """
-    if not isinstance(d, dict):
-        return False
-    need = ("consumed_kwh" not in d) or ("wh_per_km" not in d) or ("regen_kwh" not in d)
-    if not need:
-        return False
-    series = d.get("power_series") or []
-    pwrs = [{"ts": p[0], "pwr": p[1]} for p in series
-            if isinstance(p, (list, tuple)) and len(p) >= 2 and p[1] is not None]
-    if len(pwrs) < 2:
-        return False
-    kwh_pos = kwh_neg = 0.0
-    for a, b in zip(pwrs, pwrs[1:]):
-        dt_h = min((b["ts"] - a["ts"]) / 3600000.0, 60 / 3600.0)
-        if a["pwr"] > 0:
-            kwh_pos += a["pwr"] * dt_h
-        else:
-            kwh_neg += -a["pwr"] * dt_h
-    changed = False
-    if "consumed_kwh" not in d:
-        d["consumed_kwh"] = round(kwh_pos, 2)
-        changed = True
-    if "regen_kwh" not in d:
-        d["regen_kwh"] = round(kwh_neg, 2)
-        changed = True
-    dist = d.get("distance_km")
-    if "wh_per_km" not in d and dist and dist > 0.3 and kwh_pos > 0.02:
-        d["wh_per_km"] = round(max(0.0, kwh_pos - kwh_neg) * 1000 / dist)
-        changed = True
-    if "regen_rate" not in d and kwh_pos > 0.02 and kwh_neg > 0.01:
-        d["regen_rate"] = round(kwh_neg / kwh_pos * 100, 1)
-        changed = True
-    return changed

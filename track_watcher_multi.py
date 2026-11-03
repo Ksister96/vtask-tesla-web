@@ -11,6 +11,7 @@
 """
 import json
 import os
+import re
 import shutil
 import threading
 import ssl
@@ -20,12 +21,15 @@ import urllib.error
 import urllib.request
 
 import track_split
+from vehicle_measurements import normalize as normalize_measurements
 
 BASE = os.environ.get("MULTI_BASE", "/opt/tesla-fleet-multi")
+TELEMETRY_DIR = os.environ.get("TELEMETRY_STATE_DIR", "/opt/tesla-fleet/telemetry_states")
 USERS = os.path.join(BASE, "users")
 FLEET = "https://fleet-api.prd.cn.vn.cloud.tesla.cn"
 CTX = ssl.create_default_context()          # 特斯拉域名严格校验
 INTERVAL = int(sys.argv[1]) if len(sys.argv) > 1 else 60
+MOVING_INTERVAL = max(0.5, float(os.environ.get("TRACK_MOVING_INTERVAL", "1")))
 
 
 def log(msg):
@@ -38,7 +42,7 @@ def log(msg):
     print(line, flush=True)
 
 
-def sys_msg(uid, text):
+def sys_msg(uid, text, card=None):
     """系统消息：写入用户聊天流（who=sys，2026-10-23 聊天框通知中心）。
     与主应用 append_chat 跨进程并发，靠 .chat.lock flock 互斥防原子替换互踩。"""
     import fcntl
@@ -56,8 +60,12 @@ def sys_msg(uid, text):
                         messages = []
                 except Exception:
                     messages = []
-                messages.append({"who": "sys", "text": text,
-                                 "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+                message = {"who": "sys", "text": text,
+                           "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+                if (isinstance(card, dict) and card.get("type") == "trip_detail"
+                        and re.fullmatch(r"\d{8}-\d{6}", str(card.get("trip_id") or ""))):
+                    message["card"] = {"type": "trip_detail", "trip_id": str(card["trip_id"])}
+                messages.append(message)
                 messages = messages[-100:]   # 与主应用 CHAT_MAX 对齐
                 tmp = cp + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
@@ -132,6 +140,15 @@ def vid_of(uid):
         return None
 
 
+def vin_of(uid):
+    try:
+        with open(os.path.join(USERS, uid, "account.json"), encoding="utf-8-sig") as f:
+            acct = json.load(f)
+        return ((acct.get("vehicles") or [{}])[0].get("vin") or "").strip()
+    except Exception:
+        return ""
+
+
 def tok_of(uid):
     try:
         return json.load(open(os.path.join(USERS, uid, "tokens.json"),
@@ -167,23 +184,302 @@ def last_ts(uid):
 _bad_until = {}   # uid -> 冷却截止（401/403 账号 24h 内不再轮询，防日志刷屏）
 _last_moving = {}   # uid -> 上一轮是否行驶中（用于补行程收尾点）
 _trip_cur = {}      # uid -> 当前行驶段轨迹点（P 档收尾时结算）
+_charge_sess = {}   # uid -> 进行中充电会话（服务端记账：小程序关着也不漏）
+_trip_stop = {}     # uid -> first confirmed stationary P point
+_trip_loaded = set()
+_trip_vins = {}
+
+
+def _trip_checkpoint(uid):
+    path = os.path.join(USERS, uid, "trip_active.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump({"vin": vin_of(uid), "points": _trip_cur.get(uid, []), "stop": _trip_stop.get(uid)}, f)
+    os.replace(path + ".tmp", path)
+
+
+def _restore_trip(uid):
+    vin = vin_of(uid)
+    if uid in _trip_loaded and _trip_vins.get(uid) == vin:
+        return
+    if uid in _trip_loaded:
+        _trip_cur.pop(uid, None)
+        _trip_stop.pop(uid, None)
+        _last_moving.pop(uid, None)
+    _trip_loaded.add(uid)
+    _trip_vins[uid] = vin
+    try:
+        with open(os.path.join(USERS, uid, "trip_active.json"), encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved.get("vin") == vin_of(uid) and saved.get("points"):
+            _trip_cur[uid] = saved["points"]
+            _last_moving[uid] = True
+            if saved.get("stop"):
+                _trip_stop[uid] = saved["stop"]
+    except (OSError, ValueError):
+        pass
+
+
+def _charge_checkpoint(uid, sess):
+    path = os.path.join(USERS, uid, "charge_active.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump({"vin": vin_of(uid), "session": sess}, f)
+    os.replace(path + ".tmp", path)
+
+
+def _track_trip(uid, pt):
+    moving = pt.get("gear") in ("D", "R", "N") or (pt.get("spd") or 0) > 1
+    stop = _trip_stop.get(uid)
+    if moving:
+        previous = (_trip_cur.get(uid) or [None])[-1]
+        if previous and (pt["ts"] - previous["ts"] > 1200000 or
+                         time.strftime("%Y%m%d", time.localtime(pt["ts"] / 1000)) !=
+                         time.strftime("%Y%m%d", time.localtime(previous["ts"] / 1000))):
+            _finish_trip(uid)
+        if stop and not track_split.can_resume(stop, pt):
+            _finish_trip(uid)
+        _trip_stop.pop(uid, None)
+        _trip_cur.setdefault(uid, []).append(pt)
+    elif pt.get("gear") == "P" and uid in _trip_cur:
+        _trip_stop.setdefault(uid, pt)
+    _trip_checkpoint(uid)
+    # Missing gear is an unknown observation, never a parking event.
+
+
+def _finish_trip(uid):
+    seg = _trip_cur.pop(uid, None)
+    _trip_stop.pop(uid, None)
+    _trip_checkpoint(uid)
+    if seg and len(seg) >= 2:
+        threading.Thread(target=settle_trip, args=(uid, seg), daemon=True).start()
+_loc_ok = {}        # uid -> 该授权是否含 vehicle_location scope;False=用降级端点(去 location_data)
+_rest_try = {}      # uid -> 上次 REST 兜底尝试时间(节流用)
+_rest_ok = {}       # uid -> 上次 REST 兜底成功时间(行驶期快采/驻车期慢采的依据)
+_EP_FULL = "location_data%3Bcharge_state%3Bdrive_state%3Bvehicle_state%3Bclimate_state%3Bgui_settings%3Bvehicle_config"
+_EP_NOLOC = "charge_state%3Bdrive_state%3Bvehicle_state%3Bclimate_state%3Bgui_settings%3Bvehicle_config"
+
+
+def _settle_charge(uid, sess, end_ts):
+    """充电结束落账：≥2分钟且≥0.1度才记（与小程序本地阈值一致）。"""
+    dur = sess["last"] - sess["start"]
+    if dur < 120000 or sess["kwh"] < 0.1:
+        return
+    rec = {"start": sess["start"], "end": end_ts, "kwh": round(sess["kwh"], 2),
+           "soc_start": sess.get("soc0"), "soc_end": sess.get("soc"),
+           "max_power": round(sess["max_pwr"], 1), "vin": vin_of(uid),
+           "estimated": sess.get("estimated", False)}
+    if sess.get("lat") is not None and sess.get("lon") is not None:
+        rec["latitude"] = round(float(sess["lat"]), 6)
+        rec["longitude"] = round(float(sess["lon"]), 6)
+    rec["max_ac_power"] = round(float(sess.get("max_ac_pwr") or 0), 1)
+    rec["max_dc_power"] = round(float(sess.get("max_dc_pwr") or 0), 1)
+    rec["charge_type"] = "dc_fast" if rec["max_dc_power"] > 1 or sess.get("fast_charger_present") else "ac"
+    vin = vin_of(uid).upper()
+    d = os.path.join(USERS, "vehicles", vin, "charge_sessions") if vin and vin.isalnum() else os.path.join(USERS, uid, "charge_sessions")
+    os.makedirs(d, exist_ok=True)
+    fp = os.path.join(d, time.strftime("%Y%m", time.localtime(end_ts / 1000)) + ".jsonl")
+    seen = False   # 同 start 去重（进程重启可能重复开段）
+    if os.path.exists(fp):
+        try:
+            with open(fp, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        if abs(json.loads(line).get("start", 0) - rec["start"]) < 60000:
+                            seen = True
+                            break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    if not seen:
+        with open(fp, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        log("%s 充电结算 %.2fkWh %.1f小时 峰值%skW" % (uid, rec["kwh"], dur / 3600000.0, rec["max_power"]))
+
+
+def _track_charging(uid, cs):
+    """充电会话记账（2026-10-26 移植到遥测版）：Charging/Starting 累积，结束/断档超30分钟落账。
+    遥测口径无 charge_energy_added，cs["charger_power"]（ac/dc 取大者）按 功率×时间 积分。"""
+    st = cs.get("charging_state")
+    sess = _charge_sess.get(uid)
+    if sess and sess.get("vin", vin_of(uid)) != vin_of(uid):
+        _charge_sess.pop(uid, None)
+        sess = None
+    if sess is None:
+        try:
+            with open(os.path.join(USERS, uid, "charge_active.json"), encoding="utf-8") as f:
+                saved = json.load(f)
+            if saved.get("vin") == vin_of(uid):
+                sess = saved.get("session")
+                if sess:
+                    _charge_sess[uid] = sess
+        except (OSError, ValueError):
+            pass
+    now = int(cs.get("sample_ts") or time.time() * 1000)
+    if sess and now <= sess["last"]:
+        return
+    ended = str(st).lower() in ("complete", "disconnected", "stopped", "nopower")
+    if not ended and (cs.get("charging") is True or st in ("Charging", "Starting") or (cs.get("charger_power") or 0) > 1):
+        if sess and now - sess["last"] > 1800000:
+            _settle_charge(uid, sess, sess["last"])
+            sess = None
+        if not sess:
+            sess = _charge_sess[uid] = {"start": now, "base": cs.get("charge_energy_added"),
+                                        "kwh": 0.0, "last": now, "max_pwr": 0.0,
+                                        "max_ac_pwr": 0.0, "max_dc_pwr": 0.0,
+                                        "soc0": cs.get("battery_level"), "vin": vin_of(uid)}
+        added = cs.get("charge_energy_added")
+        pwr = cs.get("charger_power") or 0
+        if added is not None:
+            # Tesla's counter already covers this charging session, including
+            # energy delivered before our first observation or process restart.
+            sess["kwh"] = max(0.0, float(added))
+            sess["estimated"] = False
+        elif pwr > 0:
+            sess["kwh"] += pwr * min(120000, max(0, now - sess["last"])) / 3600000.0
+            sess["estimated"] = True
+        sess["last"] = now
+        sess["max_pwr"] = max(sess["max_pwr"], pwr)
+        sess["max_ac_pwr"] = max(float(sess.get("max_ac_pwr") or 0), float(cs.get("ac_charging_power") or 0))
+        sess["max_dc_pwr"] = max(float(sess.get("max_dc_pwr") or 0), float(cs.get("dc_charging_power") or 0))
+        if cs.get("latitude") is not None and cs.get("longitude") is not None:
+            sess["lat"], sess["lon"] = cs["latitude"], cs["longitude"]
+        if cs.get("fast_charger_present"):
+            sess["fast_charger_present"] = True
+        sess["soc"] = cs.get("battery_level")
+        _charge_checkpoint(uid, sess)
+    elif sess:   # Complete/Disconnected/Stopped…（含车睡过头、下次唤醒才看到）一律结算
+        _charge_sess.pop(uid, None)
+        _settle_charge(uid, sess, sess["last"])
+        _charge_checkpoint(uid, None)
 
 
 def poll_user(uid):
+    _restore_trip(uid)
+    stop = _trip_stop.get(uid)
+    if stop and time.time() * 1000 - stop["ts"] >= 180000:
+        _finish_trip(uid)
+    elif _trip_cur.get(uid) and time.time() * 1000 - _trip_cur[uid][-1]["ts"] > 1200000:
+        _finish_trip(uid)
     if _bad_until.get(uid, 0) > time.time():
         return
+    vin = vin_of(uid)
+    # 主路径(v2,2026-10-25):遥测驱动。车辆主动推送,零唤醒零配额;
+    # 遥测静默=车辆休眠,此时绝不调 vehicle_data(旧版 60s 轮询会重置休眠计时器,车永远在线)。
+    if vin:
+        try:
+            with open(os.path.join(TELEMETRY_DIR, "telemetry_state_%s.json" % vin), encoding="utf-8") as f:
+                td = json.load(f)
+        except Exception:
+            td = None
+        if td:
+            _lu = td.get("last_update") or 0
+            if _lu and (time.time() - _lu) > 600:
+                td = None   # 遥测帧陈旧>10分钟:可能是流断供(scope被拒/流故障),不当作"驻车"真相,落 REST 兜底
+        if td:
+            fs = normalize_measurements(td.get("fields") or {}, td.get("field_ts") or {})
+            lu = td.get("last_update") or 0
+            lat, lon = fs.get("latitude"), fs.get("longitude")
+            ac_power = float(fs.get("ac_charging_power") or 0)
+            dc_power = float(fs.get("dc_charging_power") or 0)
+            cs = {"charging_state": fs.get("charging_state") or "",
+                  "battery_level": fs.get("battery_level"),
+                  "battery_range": fs.get("rated_range"),
+                  "charging": fs.get("charging"),
+                  "charge_energy_added": fs.get("charge_energy_added"),
+                  "sample_ts": lu * 1000,
+                  "charger_power": max(ac_power, dc_power),
+                  "ac_charging_power": ac_power, "dc_charging_power": dc_power,
+                  "fast_charger_present": fs.get("fast_charger_present"),
+                  "latitude": lat, "longitude": lon}
+            charge_watch(uid, cs)   # 充电完成/低电量 → 聊天流系统消息
+            _track_charging(uid, cs)   # 充电会话记账（遥测口径：按功率×时间积分）
+            if lat is None or lon is None:
+                return
+            pt = {"ts": int(lu * 1000),
+                  "lat": round(float(lat), 6), "lon": round(float(lon), 6),
+                  "spd": float(fs["speed"]) * 1.609344 if fs.get("speed") is not None else None,
+                  "gear": fs.get("shift_state"),
+                  "odo": round((fs.get("odometer") or 0) * 1.609344, 2)}
+            times = td.get("field_ts") or {}
+            voltage, current = fs.get("pack_voltage"), fs.get("pack_current")
+            if voltage is not None and current is not None and all(
+                    0 <= lu - float(times.get(k) or 0) <= 120 for k in ("pack_voltage", "pack_current")):
+                pt["pwr"] = round(voltage * current / 1000, 2)
+                pt["power_source"] = "battery"
+            if fs.get("battery_level") is not None:
+                pt["bat"] = round(float(fs.get("battery_level")), 2)
+            rr = fs.get("rated_range")
+            if rr is not None:
+                pt["rng"] = round(float(rr) * 1.609344, 1)
+            it, ot = fs.get("inside_temp"), fs.get("outside_temp")
+            if it is not None:
+                pt["tin"] = round(float(it), 1)
+            if ot is not None:
+                pt["tout"] = round(float(ot), 1)
+            # VIN 档案刷新(定位/胎压):cn 固件的 tpms 值只在遥测这条通道
+            try:
+                ap = os.path.join(USERS, "vehicles", vin + ".json")
+                try:
+                    arch = json.load(open(ap, encoding="utf-8"))
+                except Exception:
+                    arch = {}
+                arch["latitude"] = pt["lat"]
+                arch["longitude"] = pt["lon"]
+                arch["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                tpm = {k[5:].lower(): v for k, v in fs.items() if str(k).startswith("tpms_")}
+                if tpm:
+                    arch["tire_pressure"] = tpm
+                tmp = ap + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(arch, f, ensure_ascii=False, indent=1)
+                os.replace(tmp, ap)
+            except Exception:
+                pass
+            if pt["ts"] > last_ts(uid):
+                _track_trip(uid, pt)
+            moving = (pt.get("gear") in ("D", "R", "N")) or ((pt.get("spd") or 0) > 1)
+            if not moving and not _last_moving.get(uid):
+                return   # 驻车:不写点(车睡着遥测也不来,自然静默)
+            _last_moving[uid] = moving
+            if pt["ts"] <= last_ts(uid):
+                return
+            with open(tracks_file(uid), "a", encoding="utf-8") as f:
+                f.write(json.dumps(pt, ensure_ascii=False) + "\n")
+            log(f"{uid} +点(遥测) gear={pt['gear']} odo={pt['odo']}km")
+            return bool(moving)
+    # REST 兜底节流(无遥测文件的车才走到这里):统一 60s 一采(v1 同款,2026-10-26 排查已证
+    # vehicle_data 轮询不唤醒不钉车;10-25 的"一直在线"真凶是特斯拉原生每小时心跳)
+    _now = time.time()
+    idle_cadence = int(os.environ.get("TRACK_REST_IDLE_INTERVAL", "60"))
+    cadence = 60 if _now - _rest_ok.get(uid, 0) < 1200 else idle_cadence
+    if _now - _rest_try.get(uid, 0) < cadence:
+        return
+    _rest_try[uid] = _now
     vid = vid_of(uid)
     tok = tok_of(uid)
     if not vid or not tok:
         return
+    # 端点选择:授权缺 vehicle_location scope 的 token,带 location_data 会整体 403
+    # (特斯拉 2026-10-22 前后收紧执行);降级去掉 location_data——轨迹经纬度仍由
+    # drive_state 提供,行程/充电/温度全功能不受影响。恢复完整权限:重新授权勾选位置。
+    ep = _EP_FULL if _loc_ok.get(uid, True) else _EP_NOLOC
     try:
         # endpoints 串 = 主应用同款（分号必须 %3B 编码：2026-10-07 实测 cn 网关对裸分号
         # 只下发 location_data，drive_state/vehicle_state 段全被吞 → gear/odo/速度全空）
-        d = http_json(f"{FLEET}/api/1/vehicles/{vid}/vehicle_data?endpoints=location_data%3Bcharge_state%3Bdrive_state%3Bvehicle_state%3Bclimate_state%3Bgui_settings%3Bvehicle_config", tok)
+        d = http_json(f"{FLEET}/api/1/vehicles/{vid}/vehicle_data?endpoints={ep}", tok)
     except urllib.error.HTTPError as e:
         if e.code in (408, 504):
             return  # 车睡着：vehicle_data 不唤醒，静默跳过（零成本）
         if e.code in (401, 403):
+            body = ''
+            try:
+                body = e.read().decode('utf-8', 'replace')
+            except Exception:
+                pass
+            if 'vehicle_location' in body and _loc_ok.get(uid, True):
+                _loc_ok[uid] = False   # 下一轮起用降级端点
+                log(f"{uid} 授权缺 vehicle_location scope(403),降级端点去 location_data;轨迹仍由 drive_state 提供,完整恢复需重新授权勾选位置")
+                return
             # 2026-10-07 从 24h 降到 10min：主应用会刷新 token 落盘，本进程每轮重读
             # tokens.json，10 分钟后即用新 token 恢复。24h 冷却曾致整程轨迹漏采
             # （2026-10-07 早高峰用户开车时处于冷却期，路线全空）。
@@ -196,6 +492,7 @@ def poll_user(uid):
         log(f"{uid} 网络/证书错误: {e}")
         return
     resp = (d or {}).get("response") or {}
+    _rest_ok[uid] = time.time()   # 200:车醒着,接下来 20 分钟内保持 60s 快采
     ds = resp.get("drive_state") or {}
     vs = resp.get("vehicle_state") or {}
     lat, lon = ds.get("latitude"), ds.get("longitude")
@@ -243,6 +540,11 @@ def poll_user(uid):
     cs = resp.get("charge_state") or {}
     cl = resp.get("climate_state") or {}
     charge_watch(uid, cs)   # 充电完成/低电量 → 聊天流系统消息（须在驻车早退之前）
+    cs = dict(cs)
+    cs["latitude"], cs["longitude"] = lat, lon
+    cs["ac_charging_power"] = float(cs.get("charger_actual_current") or 0) * float(cs.get("charger_voltage") or 0) / 1000.0
+    cs["dc_charging_power"] = float(cs.get("charger_power") or 0) if cs.get("fast_charger_present") else 0
+    _track_charging(uid, cs)   # 充电会话记账（须在驻车早退之前：驻车充电正是要记的）
     if ds2.get("power") is not None:
         pt["pwr"] = round(float(ds2.get("power")), 1)   # kW：行驶为正/动能回收为负
     if cs.get("battery_level") is not None:
@@ -264,13 +566,7 @@ def poll_user(uid):
     log(f"{uid} +点 gear={pt['gear']} odo={pt['odo']}km")
 
     # 行程缓冲：行驶中累积，P 档收尾结算为行程详情
-    if moving:
-        _trip_cur.setdefault(uid, []).append(pt)
-    else:
-        seg = _trip_cur.pop(uid, None)
-        if seg and len(seg) >= 2:
-            seg.append(pt)
-            threading.Thread(target=settle_trip, args=(uid, seg), daemon=True).start()
+    _track_trip(uid, pt)
     vc = resp.get("vehicle_config") or {}
     ec = vc.get("exterior_color")
     if ec:
@@ -314,6 +610,27 @@ def settle_trip(uid, seg):
     if not _dist or _dist < 0.3 or _dur_s < 120:
         return   # 挪车/极短移动不算行程
     detail = track_split.build_detail(moving)
+    # 重复结算防护（2026-10-24）：3 分钟内已有里程差<0.3km 且时长差<5min 的结算文件时跳过
+    #（历史上 P 档判定失守曾把同一段每轮重结算一次，一天同段写 40+ 个近似 ID 文件）
+    try:
+        ddir_chk = os.path.join(USERS, uid, "trip_details")
+        if os.path.isdir(ddir_chk):
+            import glob as _g
+            for fp in _g.glob(os.path.join(ddir_chk, detail["id"][:8] + "*.json")):
+                try:
+                    prev = json.load(open(fp, encoding="utf-8"))
+                except Exception:
+                    continue
+                ptid = os.path.basename(fp)[:-5]
+                import time as _t
+                _a = _t.mktime(_t.strptime(detail["id"], "%Y%m%d-%H%M%S"))
+                _b = _t.mktime(_t.strptime(ptid, "%Y%m%d-%H%M%S"))
+                if abs(_a - _b) <= 180 and abs((detail.get("distance_km") or 0) - (prev.get("distance_km") or 0)) < 0.3 \
+                        and abs((detail.get("duration_min") or 0) - (prev.get("duration_min") or 0)) <= 5:
+                    log(f"{uid} 跳过重复结算 {detail['id']} ≈ {ptid}")
+                    return
+    except Exception:
+        pass
     # 起终点逆地理
     for tag, p in (("start", moving[0]), ("end", moving[-1])):
         addr = regeo(p["lat"], p["lon"])
@@ -336,26 +653,27 @@ def settle_trip(uid, seg):
         s_addr = (detail.get("start_addr") or "").strip()
         e_addr = (detail.get("end_addr") or "").strip()
         tail = f"，从{s_addr[:12]}到{e_addr[:12]}" if s_addr and e_addr else ""
-        sys_msg(uid, f"🚗 行程完成：{_dist} km · {int(_dur_s // 60)} 分钟{tail}")
+        sys_msg(uid, f"🚗 行程完成：{_dist} km · {int(_dur_s // 60)} 分钟{tail}",
+                {"type": "trip_detail", "trip_id": detail["id"]})
+    except Exception:
+        pass
+    # 订阅消息（2026-10-24）：用户授权过则微信通知，失败静默
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8794/internal/wxmsg",
+            data=json.dumps({"uid": uid, "title": "行程完成",
+                             "value": "%.1f km · %d 分钟" % (_dist, _dur_s / 60)}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).read()
     except Exception:
         pass
     log("%s 行程结算 %s %.1fkm %d分钟" % (uid, detail["id"], _dist, _dur_s / 60))
 
 
 def cleanup_old():
-    """删两个月前的轨迹月文件（当月+上月保留），每天清一次即可。"""
-    keep = {time.strftime("%Y%m"), time.strftime("%Y%m", time.localtime(time.time() - 30 * 86400))}
-    for uid in user_ids():
-        d = os.path.join(USERS, uid, "tracks")
-        if not os.path.isdir(d):
-            continue
-        for fn in os.listdir(d):
-            if fn.endswith(".jsonl") and fn[:6].isdigit() and fn[:6] not in keep:
-                try:
-                    os.remove(os.path.join(d, fn))
-                    log(f"{uid} 清理旧轨迹 {fn}")
-                except Exception:
-                    pass
+    """轨迹点月文件清理：2026-10-24 起行程做长线存储（trip_details 永久保留、
+    行程回顾支持周/月/年筛选），不再删轨迹点（旧点文件是历史行程即时补算的唯一来源）。"""
+    return
 
 
 def main():
@@ -370,7 +688,7 @@ def main():
         pass
     with open(pidfile, "w") as f:
         f.write(str(os.getpid()))
-    log(f"watcher start interval={INTERVAL}s pid={os.getpid()} base={BASE}")
+    log(f"watcher start idle_interval={INTERVAL}s moving_interval={MOVING_INTERVAL}s pid={os.getpid()} base={BASE}")
     last_clean = ""
     while True:
         try:
@@ -384,8 +702,9 @@ def main():
                     any_moving = True
         except Exception as e:
             log("loop err: %s" % e)
-        # 行驶中加密到 20s（路线更顺滑）；驻车 60s 基线（API 限速 60次/分/车，配额与顺滑度平衡）
-        time.sleep(10 if any_moving else INTERVAL)
+        # 行驶中每1s读一次本地遥测快照：不调用 Tesla API、不唤醒车辆；
+        # 驻车仍按60s基线。此前10s抽样会漏掉最高车速，也难以形成连续功率曲线。
+        time.sleep(MOVING_INTERVAL if any_moving else INTERVAL)
 
 
 if __name__ == "__main__":
