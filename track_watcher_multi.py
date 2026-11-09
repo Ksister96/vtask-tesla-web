@@ -659,12 +659,23 @@ def settle_trip(uid, seg):
         pass
     # 一次性订阅：行程真正结束才发。失败只记日志，不打断 settle。
     try:
+        _mins = int(_dur_s // 60)
+        if _mins < 60:
+            _dur_txt = "%d分钟" % _mins
+        elif _mins % 60 == 0:
+            _dur_txt = "%d小时" % (_mins // 60)
+        else:
+            _dur_txt = "%d时%d分" % (_mins // 60, _mins % 60)
+        if len(_dur_txt) > 5:
+            _dur_txt = "%d分" % _mins
         req = urllib.request.Request(
             "http://127.0.0.1:8794/internal/wxmsg",
             data=json.dumps({
                 "uid": uid,
-                "title": "行程结束",
-                "value": "%.1f km · %d 分钟" % (_dist, _dur_s / 60),
+                "start": (detail.get("start_addr") or "").strip(),
+                "end": (detail.get("end_addr") or "").strip(),
+                "duration": _dur_txt,
+                "mileage": "%.1fkm" % _dist,
                 "trip_id": detail.get("id") or "",
             }).encode("utf-8"),
             headers={"Content-Type": "application/json"})

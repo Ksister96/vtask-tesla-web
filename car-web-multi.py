@@ -71,7 +71,8 @@ AMAP_MAP_SEM = threading.BoundedSemaphore(1)
 MP_WX_APPID = os.environ.get("MP_WX_APPID", "")
 _WXMSG_TOKEN = {"tok": "", "ts": 0}   # 订阅消息 access_token 进程级缓存
 # 行程一次性订阅（个人主体；换模板只改这里或对应环境变量，不要散落硬编码）
-# 现网默认：车辆状态提醒 27866 → phrase1 + thing12
+# 默认 layout=trip4：行程结束通知 → thing1/thing2/short_thing3/character_string4
+# 切回旧「车辆状态提醒」：WXMSG_LAYOUT=status2 + WXMSG_TRIP_TMPL=旧 ID（见下方 legacy 常量）
 def _wxmsg_env_str(name, default):
     v = str(os.environ.get(name, "") or "").strip()
     return v or default
@@ -86,8 +87,23 @@ def _wxmsg_env_int(name, default):
     except Exception:
         return default
 
+WXMSG_LAYOUT = _wxmsg_env_str("WXMSG_LAYOUT", "trip4").lower()  # trip4 | status2
 WXMSG_TRIP_TMPL = _wxmsg_env_str(
-    "WXMSG_TRIP_TMPL", "zErBRh7BVm9q7SEJe8FpINXm0qg8Af5oDNHCsMrSDxM")
+    "WXMSG_TRIP_TMPL", "Qd_2YRBEOPkeUYG8pSwXi8H2dscjrhqqdebRonPVWTw")
+# trip4 字段（行程结束通知；场景说明「回顾行程」固定，不传）
+WXMSG_FIELD_START = _wxmsg_env_str("WXMSG_FIELD_START", "thing1")
+WXMSG_FIELD_END = _wxmsg_env_str("WXMSG_FIELD_END", "thing2")
+WXMSG_FIELD_DURATION = _wxmsg_env_str("WXMSG_FIELD_DURATION", "short_thing3")
+WXMSG_FIELD_MILEAGE = _wxmsg_env_str("WXMSG_FIELD_MILEAGE", "character_string4")
+WXMSG_START_MAX = _wxmsg_env_int("WXMSG_START_MAX", 20)
+WXMSG_END_MAX = _wxmsg_env_int("WXMSG_END_MAX", 20)
+WXMSG_DURATION_MAX = _wxmsg_env_int("WXMSG_DURATION_MAX", 5)
+WXMSG_MILEAGE_MAX = _wxmsg_env_int("WXMSG_MILEAGE_MAX", 32)
+WXMSG_START_DEFAULT = _wxmsg_env_str("WXMSG_START_DEFAULT", "出发地")
+WXMSG_END_DEFAULT = _wxmsg_env_str("WXMSG_END_DEFAULT", "目的地")
+WXMSG_DURATION_DEFAULT = _wxmsg_env_str("WXMSG_DURATION_DEFAULT", "已结束")
+WXMSG_MILEAGE_DEFAULT = _wxmsg_env_str("WXMSG_MILEAGE_DEFAULT", "0km")
+# status2 legacy（车辆状态提醒 phrase1+thing12；env 切回时用）
 WXMSG_FIELD_PHRASE = _wxmsg_env_str("WXMSG_FIELD_PHRASE", "phrase1")
 WXMSG_FIELD_THING = _wxmsg_env_str("WXMSG_FIELD_THING", "thing12")
 WXMSG_PHRASE_MAX = _wxmsg_env_int("WXMSG_PHRASE_MAX", 5)
@@ -890,21 +906,122 @@ def _wxmsg_trim(seq, cap=40):
         del seq[:-cap]
 
 
-def wxmsg_trip_payload(title, value, when_s=None):
-    """订阅卡片字段：字段名/长度/默认文案一律读模块顶部 WXMSG_* 配置。
-    现网默认 phrase1（≤5）+ thing12（≤20）；第三行场景说明固定，不传变量。
-    含特斯拉/Tesla 时改回中性默认文案。when_s 已废弃，忽略。"""
+def _wxmsg_has_brand(text):
+    t = str(text or "")
+    return ("特斯拉" in t) or ("tesla" in t.lower())
+
+
+def wxmsg_sanitize_thing(text, max_len, default):
+    """thing / short_thing：去商标、按长度截断；空则回落默认（避免微信 47003）。"""
+    text = str(text or "").strip()
+    if _wxmsg_has_brand(text):
+        text = ""
+    if not text:
+        text = str(default or "").strip()
+    if not text:
+        text = "-"
+    return text[:max(1, int(max_len or 1))]
+
+
+def wxmsg_sanitize_character_string(text, max_len, default):
+    """character_string：禁止汉字；公里→km；只留数字/字母/符号；空则回落默认。"""
+    text = str(text or "").strip()
+    if _wxmsg_has_brand(text):
+        text = ""
+    if text:
+        text = text.replace("公里", "km").replace("千米", "km")
+        text = re.sub(r"[\u4e00-\u9fff]+", "", text)
+        text = re.sub(r"[^0-9A-Za-z._+\-/%]", "", text)
+    if not text:
+        text = str(default or "").strip() or "0km"
+        text = re.sub(r"[\u4e00-\u9fff]+", "", text)
+        text = re.sub(r"[^0-9A-Za-z._+\-/%]", "", text) or "0km"
+    return text[:max(1, int(max_len or 1))]
+
+
+def wxmsg_format_duration_min(minutes):
+    """把分钟压成 short_thing（默认 ≤5 字）：35分钟 / 1时20分 / 2小时。"""
+    try:
+        minutes = int(round(float(minutes)))
+    except Exception:
+        return ""
+    if minutes < 0:
+        minutes = 0
+    if minutes < 60:
+        s = "%d分钟" % minutes
+    elif minutes % 60 == 0:
+        s = "%d小时" % (minutes // 60)
+    else:
+        s = "%d时%d分" % (minutes // 60, minutes % 60)
+    if len(s) > WXMSG_DURATION_MAX:
+        s = "%d分" % minutes
+    if len(s) > WXMSG_DURATION_MAX:
+        s = "%dm" % minutes
+    return s[:WXMSG_DURATION_MAX]
+
+
+def _wxmsg_parse_legacy_value(value):
+    """旧 value（如「12.3 km · 25 分钟」）拆出 mileage / duration 提示。"""
+    value = str(value or "")
+    mileage = ""
+    duration = ""
+    m = re.search(r"([\d.]+)\s*km", value, re.I)
+    if m:
+        mileage = m.group(1) + "km"
+    else:
+        m2 = re.search(r"([\d.]+)\s*公里", value)
+        if m2:
+            mileage = m2.group(1) + "km"
+    d = re.search(r"(\d+)\s*分钟", value)
+    if d:
+        duration = wxmsg_format_duration_min(d.group(1))
+    return mileage, duration
+
+
+def wxmsg_trip_payload(start=None, end=None, duration=None, mileage=None,
+                       title=None, value=None, when_s=None):
+    """订阅卡片字段：一律读模块顶部 WXMSG_*。
+    trip4 默认：start/end/duration/mileage → thing1/thing2/short_thing3/character_string4。
+    status2（env 切回旧模板）：title/value → phrase1/thing12。
+    兼容旧调用只传 title/value：不报错，尽量填满字段。when_s 已废弃。"""
+    layout = str(WXMSG_LAYOUT or "trip4").lower()
     title = str(title or "").strip()
-    if (not title) or ("特斯拉" in title) or ("tesla" in title.lower()):
-        title = WXMSG_PHRASE_DEFAULT
     value = str(value or "").strip()
-    if ("特斯拉" in value) or ("tesla" in value.lower()):
-        value = ""
-    if not value:
-        value = WXMSG_THING_DEFAULT
+    if layout == "status2":
+        phrase = title
+        thing = value
+        if (not phrase) or _wxmsg_has_brand(phrase):
+            phrase = WXMSG_PHRASE_DEFAULT
+        if _wxmsg_has_brand(thing):
+            thing = ""
+        if not thing:
+            thing = WXMSG_THING_DEFAULT
+        return {
+            WXMSG_FIELD_PHRASE: {"value": wxmsg_sanitize_thing(phrase, WXMSG_PHRASE_MAX, WXMSG_PHRASE_DEFAULT)},
+            WXMSG_FIELD_THING: {"value": wxmsg_sanitize_thing(thing, WXMSG_THING_MAX, WXMSG_THING_DEFAULT)},
+        }
+    start = str(start or "").strip()
+    end = str(end or "").strip()
+    duration = str(duration or "").strip()
+    mileage = str(mileage or "").strip()
+    leg_m, leg_d = _wxmsg_parse_legacy_value(value)
+    if not mileage and leg_m:
+        mileage = leg_m
+    if not duration and leg_d:
+        duration = leg_d
+    if not duration and title:
+        duration = title
+    if not end and value and not leg_m:
+        end = value
     return {
-        WXMSG_FIELD_PHRASE: {"value": title[:WXMSG_PHRASE_MAX]},
-        WXMSG_FIELD_THING: {"value": value[:WXMSG_THING_MAX]},
+        WXMSG_FIELD_START: {
+            "value": wxmsg_sanitize_thing(start, WXMSG_START_MAX, WXMSG_START_DEFAULT)},
+        WXMSG_FIELD_END: {
+            "value": wxmsg_sanitize_thing(end, WXMSG_END_MAX, WXMSG_END_DEFAULT)},
+        WXMSG_FIELD_DURATION: {
+            "value": wxmsg_sanitize_thing(duration, WXMSG_DURATION_MAX, WXMSG_DURATION_DEFAULT)},
+        WXMSG_FIELD_MILEAGE: {
+            "value": wxmsg_sanitize_character_string(mileage, WXMSG_MILEAGE_MAX, WXMSG_MILEAGE_DEFAULT)},
     }
 
 
@@ -3641,15 +3758,19 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
 
     def _internal_wxmsg(self):
         """内部接口：行程真正结束时发一条一次性订阅消息（仅 127.0.0.1）。
-        body: {"uid","title","value","page","trip_id"}
-        小程序若已 POST /api/wxmsg/accept，成功后剩余次数 -1，43101 清零；
+        body 推荐: {"uid","start","end","duration","mileage","page","trip_id"}
+        兼容旧字段 title/value。小程序若已 POST /api/wxmsg/accept，成功后剩余次数 -1；
         从未上报则仍发送，按微信「接受一次发一次」，成功和失败都写日志。"""
         if not self.client_address or not str(self.client_address[0]).startswith("127."):
             self._json(403, {"ok": False})
             return
         data = self._parse_json() or {}
         uid = str(data.get("uid") or "")
-        title = str(data.get("title") or WXMSG_PHRASE_DEFAULT)
+        start = str(data.get("start") or "")
+        end = str(data.get("end") or "")
+        duration = str(data.get("duration") or "")
+        mileage = str(data.get("mileage") or "")
+        title = str(data.get("title") or "")
         value = str(data.get("value") or "")
         page = data.get("page") or "pages/home/home"
         trip_id = str(data.get("trip_id") or "")
@@ -3669,8 +3790,10 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             log_line("wxmsg", f"跳过发送 uid={uid} trip={_wxmsg_trip_id(trip_id) or '-'} reason={prep['reason']} remain={prep.get('remain')}")
             self._json(200, {"ok": True, "sent": False, "reason": prep["reason"], "remain": prep.get("remain")})
             return
-        result = self.send_subscribe_msg(
-            openid, WXMSG_TRIP_TMPL, wxmsg_trip_payload(title, value), page)
+        card = wxmsg_trip_payload(
+            start=start, end=end, duration=duration, mileage=mileage,
+            title=title, value=value)
+        result = self.send_subscribe_msg(openid, WXMSG_TRIP_TMPL, card, page)
         applied = wxmsg_apply_send_result(
             uid, WXMSG_TRIP_TMPL, trip_id, ok=bool(result.get("ok")), errcode=result.get("errcode"))
         body = {"ok": True, "sent": bool(result.get("ok")), "errcode": result.get("errcode")}
