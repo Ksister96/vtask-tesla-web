@@ -172,7 +172,7 @@ assert trip.sent[0]["tmpl"] == CAR.WXMSG_TRIP_TMPL, trip.sent
 assert trip.sent[0]["via"] == "trip"
 assert "thing1" in trip.sent[0]["data"]
 
-# Complete 路径：发一次，重复 session 不双发；字段就是充电模板
+# 充电结束路径：发一次，重复 session 不双发；字段就是充电模板（充满/中断共用）
 body = {
     "uid": "u9", "kind": "charge",
     "start_ts": START, "end_ts": END,

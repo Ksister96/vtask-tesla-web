@@ -3687,7 +3687,7 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "sent": bool(sent)})
 
     def _internal_wxmsg_charge(self, data):
-        """充满/达限额（kind=charge）。模板按 WXMSG_CHARGE_*；按模板分账；同 session 只发一次。"""
+        """充电结束（充满/中断/拔枪，kind=charge）。模板按 WXMSG_CHARGE_*；按模板分账；同 session 只发一次。"""
         uid = str(data.get("uid") or "").strip()
         if not uid:
             self._json(400, {"ok": False, "error": "missing uid"})

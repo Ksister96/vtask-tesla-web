@@ -110,12 +110,26 @@ def post_charge_wxmsg(uid, payload):
         log(f"{uid} charge wxmsg err: {e}")
 
 
+def _charge_end_reason(cur):
+    """结束原因只进内部 body，不进微信模板。空状态记 ended。"""
+    known = {
+        "Complete": "complete",
+        "Stopped": "stopped",
+        "Disconnected": "disconnected",
+        "NoPower": "nopower",
+    }
+    if cur in known:
+        return known[cur]
+    token = re.sub(r"[^A-Za-z0-9_]+", "", str(cur or "")).lower()
+    return token or "ended"
+
+
 def charge_watch(uid, cs):
     """充电完成 / 低电量 → 聊天流系统消息（2026-10-23）。
     状态存 users/<uid>/charge_watch.json 跨轮记忆；泊车驻车轮次也会走到这里
     （poll_user 在驻车早退之前调用本函数，充电过夜同样能感知）。
-    微信只在「上一轮 Charging → 本轮 Complete」发一次（充满/达限额）。
-    Stopped / Disconnected / 低电量 / 开始充电都不发微信。"""
+    微信：上一轮 Charging → 本轮不再充电（Complete / Stopped / Disconnected / NoPower 等）发一次。
+    同一会话只发一次。低电量、充电开始不发微信。聊天「充电完成」仍只在 Complete。"""
     try:
         cur = (cs or {}).get("charging_state") or ""
         soc = (cs or {}).get("battery_level")
@@ -136,12 +150,15 @@ def charge_watch(uid, cs):
             new["since"] = time.time()
             new["soc0"] = _charge_num(soc)
             new["energy0"] = _charge_num((cs or {}).get("charge_energy_added"))
+        # Starting 仍在充电流程里，不算结束。其余离开 Charging 的状态都算充电结束。
+        charge_ended = pstate == "Charging" and cur not in ("Charging", "Starting")
         if pstate == "Charging" and cur == "Complete":
             m = int(max(0, time.time() - (new.get("since") or time.time())) // 60)
             dur = f"，用时 {m // 60}小时{m % 60:02d}分" if m >= 60 else (f"，用时 {m} 分钟" if m > 0 else "")
             rng = (cs or {}).get("battery_range")
             rng_s = f"，续航约 {round(float(rng) * 1.609344)} km" if rng else ""
             msg = f"🔌 充电完成：当前 {soc}%{rng_s}{dur}"
+        if charge_ended:
             start_ts = _charge_epoch_seconds(new.get("since"))
             end_ts = _charge_epoch_seconds((cs or {}).get("sample_ts")) or time.time()
             added = _charge_num((cs or {}).get("charge_energy_added"))
@@ -161,7 +178,7 @@ def charge_watch(uid, cs):
                 "end_ts": end_ts,
                 "soc_start": soc0,
                 "soc_end": soc_end,
-                "end_reason": "complete",
+                "end_reason": _charge_end_reason(cur),
                 # 同一 since 永远得到同一个键；毫秒只为了相邻两次开充不被压成同一秒
                 "session_id": str(int(round(anchor * 1000))),
             }
