@@ -70,7 +70,49 @@ AMAP_MAP_SEM = threading.BoundedSemaphore(1)
 # 小程序（微信）凭据：环境变量注入；两者齐备走真 code2session，缺省为 mock 模式
 MP_WX_APPID = os.environ.get("MP_WX_APPID", "")
 _WXMSG_TOKEN = {"tok": "", "ts": 0}   # 订阅消息 access_token 进程级缓存
-WXMSG_TRIP_TMPL = "zErBRh7BVm9q7SEJe8FpINXm0qg8Af5oDNHCsMrSDxM"   # 行程通知订阅模板
+# 行程一次性订阅（个人主体；换模板只改这里或对应环境变量，不要散落硬编码）
+# 默认 layout=trip4：行程结束通知 → thing1/thing2/short_thing3/character_string4
+# 切回旧「车辆状态提醒」：WXMSG_LAYOUT=status2 + WXMSG_TRIP_TMPL=旧 ID（见下方 legacy 常量）
+def _wxmsg_env_str(name, default):
+    v = str(os.environ.get(name, "") or "").strip()
+    return v or default
+
+def _wxmsg_env_int(name, default):
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+        return n if n > 0 else default
+    except Exception:
+        return default
+
+WXMSG_LAYOUT = _wxmsg_env_str("WXMSG_LAYOUT", "trip4").lower()  # trip4 | status2
+WXMSG_TRIP_TMPL = _wxmsg_env_str(
+    "WXMSG_TRIP_TMPL", "Qd_2YRBEOPkeUYG8pSwXi8H2dscjrhqqdebRonPVWTw")
+# trip4 字段（行程结束通知；场景说明「回顾行程」固定，不传）
+WXMSG_FIELD_START = _wxmsg_env_str("WXMSG_FIELD_START", "thing1")
+WXMSG_FIELD_END = _wxmsg_env_str("WXMSG_FIELD_END", "thing2")
+WXMSG_FIELD_DURATION = _wxmsg_env_str("WXMSG_FIELD_DURATION", "short_thing3")
+WXMSG_FIELD_MILEAGE = _wxmsg_env_str("WXMSG_FIELD_MILEAGE", "character_string4")
+WXMSG_START_MAX = _wxmsg_env_int("WXMSG_START_MAX", 20)
+WXMSG_END_MAX = _wxmsg_env_int("WXMSG_END_MAX", 20)
+WXMSG_DURATION_MAX = _wxmsg_env_int("WXMSG_DURATION_MAX", 5)
+WXMSG_MILEAGE_MAX = _wxmsg_env_int("WXMSG_MILEAGE_MAX", 32)
+WXMSG_START_DEFAULT = _wxmsg_env_str("WXMSG_START_DEFAULT", "出发地")
+WXMSG_END_DEFAULT = _wxmsg_env_str("WXMSG_END_DEFAULT", "目的地")
+WXMSG_DURATION_DEFAULT = _wxmsg_env_str("WXMSG_DURATION_DEFAULT", "已结束")
+WXMSG_MILEAGE_DEFAULT = _wxmsg_env_str("WXMSG_MILEAGE_DEFAULT", "0km")
+# status2 legacy（车辆状态提醒 phrase1+thing12；env 切回时用）
+WXMSG_FIELD_PHRASE = _wxmsg_env_str("WXMSG_FIELD_PHRASE", "phrase1")
+WXMSG_FIELD_THING = _wxmsg_env_str("WXMSG_FIELD_THING", "thing12")
+WXMSG_PHRASE_MAX = _wxmsg_env_int("WXMSG_PHRASE_MAX", 5)
+WXMSG_THING_MAX = _wxmsg_env_int("WXMSG_THING_MAX", 20)
+WXMSG_PHRASE_DEFAULT = _wxmsg_env_str("WXMSG_PHRASE_DEFAULT", "行程结束")
+WXMSG_THING_DEFAULT = _wxmsg_env_str("WXMSG_THING_DEFAULT", "已到达")
+WXMSG_QUOTA_FILE = os.path.join(BASE, "wxmsg-quota.json")         # 本地一次性额度：accept +1，发送成功 -1
+WXMSG_QUOTA_CAP = 20
+_wxmsg_quota_lock = threading.Lock()
 MP_WX_SECRET = os.environ.get("MP_WX_SECRET", "")
 
 VOICE_SILENCE_HALLUCINATIONS = {"我", "嗯", "啊", "呃", "额", "哦"}
@@ -789,6 +831,338 @@ def ensure_codes_file():
         "demo01": {"name": "演示朋友", "enabled": True, "note": "示例码，请改成你自己的"},
     })
     log_line("init", f"已生成初始 {CODES_FILE}")
+
+
+def _wxmsg_trip_id(raw):
+    """行程号只留安全字符，避免把任意字符串写进额度文件。空串表示「不按行程去重」。"""
+    s = str(raw or "").strip()
+    if not s or len(s) > 64 or not re.fullmatch(r"[A-Za-z0-9_\-]+", s):
+        return ""
+    return s
+
+
+def _wxmsg_quota_load():
+    try:
+        with open(WXMSG_QUOTA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _wxmsg_quota_save(data):
+    try:
+        os.makedirs(os.path.dirname(WXMSG_QUOTA_FILE) or ".", exist_ok=True)
+        tmp = WXMSG_QUOTA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, WXMSG_QUOTA_FILE)
+    except Exception as e:
+        log_line("wxmsg", f"额度写入失败: {e}")
+
+
+def _wxmsg_blank_slot():
+    return {"tracked": False, "remain": 0, "accept_trips": [], "sent_trips": []}
+
+
+def _wxmsg_slot(data, uid, tmpl):
+    user = data.get(uid)
+    if not isinstance(user, dict):
+        user = {}
+        data[uid] = user
+    tmpls = user.get("tmpls")
+    if not isinstance(tmpls, dict):
+        tmpls = {}
+        user["tmpls"] = tmpls
+    slot = tmpls.get(tmpl)
+    if not isinstance(slot, dict):
+        slot = _wxmsg_blank_slot()
+        tmpls[tmpl] = slot
+    if not isinstance(slot.get("accept_trips"), list):
+        slot["accept_trips"] = []
+    if not isinstance(slot.get("sent_trips"), list):
+        slot["sent_trips"] = []
+    slot["tracked"] = bool(slot.get("tracked"))
+    try:
+        slot["remain"] = int(slot.get("remain") or 0)
+    except (TypeError, ValueError):
+        slot["remain"] = 0
+    return slot
+
+
+def _wxmsg_existing_slot(data, uid, tmpl):
+    user = data.get(uid)
+    if not isinstance(user, dict):
+        return None
+    tmpls = user.get("tmpls")
+    if not isinstance(tmpls, dict):
+        return None
+    slot = tmpls.get(tmpl)
+    return slot if isinstance(slot, dict) else None
+
+
+def _wxmsg_trim(seq, cap=40):
+    if len(seq) > cap:
+        del seq[:-cap]
+
+
+def _wxmsg_has_brand(text):
+    t = str(text or "")
+    return ("特斯拉" in t) or ("tesla" in t.lower())
+
+
+def wxmsg_sanitize_thing(text, max_len, default):
+    """thing / short_thing：去商标、按长度截断；空则回落默认（避免微信 47003）。"""
+    text = str(text or "").strip()
+    if _wxmsg_has_brand(text):
+        text = ""
+    if not text:
+        text = str(default or "").strip()
+    if not text:
+        text = "-"
+    return text[:max(1, int(max_len or 1))]
+
+
+def wxmsg_sanitize_character_string(text, max_len, default):
+    """character_string：禁止汉字；公里→km；只留数字/字母/符号；空则回落默认。"""
+    text = str(text or "").strip()
+    if _wxmsg_has_brand(text):
+        text = ""
+    if text:
+        text = text.replace("公里", "km").replace("千米", "km")
+        text = re.sub(r"[\u4e00-\u9fff]+", "", text)
+        text = re.sub(r"[^0-9A-Za-z._+\-/%]", "", text)
+    if not text:
+        text = str(default or "").strip() or "0km"
+        text = re.sub(r"[\u4e00-\u9fff]+", "", text)
+        text = re.sub(r"[^0-9A-Za-z._+\-/%]", "", text) or "0km"
+    return text[:max(1, int(max_len or 1))]
+
+
+def wxmsg_format_duration_min(minutes):
+    """把分钟压成 short_thing（默认 ≤5 字）：35分钟 / 1时20分 / 2小时。"""
+    try:
+        minutes = int(round(float(minutes)))
+    except Exception:
+        return ""
+    if minutes < 0:
+        minutes = 0
+    if minutes < 60:
+        s = "%d分钟" % minutes
+    elif minutes % 60 == 0:
+        s = "%d小时" % (minutes // 60)
+    else:
+        s = "%d时%d分" % (minutes // 60, minutes % 60)
+    if len(s) > WXMSG_DURATION_MAX:
+        s = "%d分" % minutes
+    if len(s) > WXMSG_DURATION_MAX:
+        s = "%dm" % minutes
+    return s[:WXMSG_DURATION_MAX]
+
+
+def _wxmsg_parse_legacy_value(value):
+    """旧 value（如「12.3 km · 25 分钟」）拆出 mileage / duration 提示。"""
+    value = str(value or "")
+    mileage = ""
+    duration = ""
+    m = re.search(r"([\d.]+)\s*km", value, re.I)
+    if m:
+        mileage = m.group(1) + "km"
+    else:
+        m2 = re.search(r"([\d.]+)\s*公里", value)
+        if m2:
+            mileage = m2.group(1) + "km"
+    d = re.search(r"(\d+)\s*分钟", value)
+    if d:
+        duration = wxmsg_format_duration_min(d.group(1))
+    return mileage, duration
+
+
+def wxmsg_trip_payload(start=None, end=None, duration=None, mileage=None,
+                       title=None, value=None, when_s=None):
+    """订阅卡片字段：一律读模块顶部 WXMSG_*。
+    trip4 默认：start/end/duration/mileage → thing1/thing2/short_thing3/character_string4。
+    status2（env 切回旧模板）：title/value → phrase1/thing12。
+    兼容旧调用只传 title/value：不报错，尽量填满字段。when_s 已废弃。"""
+    layout = str(WXMSG_LAYOUT or "trip4").lower()
+    title = str(title or "").strip()
+    value = str(value or "").strip()
+    if layout == "status2":
+        phrase = title
+        thing = value
+        if (not phrase) or _wxmsg_has_brand(phrase):
+            phrase = WXMSG_PHRASE_DEFAULT
+        if _wxmsg_has_brand(thing):
+            thing = ""
+        if not thing:
+            thing = WXMSG_THING_DEFAULT
+        return {
+            WXMSG_FIELD_PHRASE: {"value": wxmsg_sanitize_thing(phrase, WXMSG_PHRASE_MAX, WXMSG_PHRASE_DEFAULT)},
+            WXMSG_FIELD_THING: {"value": wxmsg_sanitize_thing(thing, WXMSG_THING_MAX, WXMSG_THING_DEFAULT)},
+        }
+    start = str(start or "").strip()
+    end = str(end or "").strip()
+    duration = str(duration or "").strip()
+    mileage = str(mileage or "").strip()
+    leg_m, leg_d = _wxmsg_parse_legacy_value(value)
+    if not mileage and leg_m:
+        mileage = leg_m
+    if not duration and leg_d:
+        duration = leg_d
+    if not duration and title:
+        duration = title
+    if not end and value and not leg_m:
+        end = value
+    return {
+        WXMSG_FIELD_START: {
+            "value": wxmsg_sanitize_thing(start, WXMSG_START_MAX, WXMSG_START_DEFAULT)},
+        WXMSG_FIELD_END: {
+            "value": wxmsg_sanitize_thing(end, WXMSG_END_MAX, WXMSG_END_DEFAULT)},
+        WXMSG_FIELD_DURATION: {
+            "value": wxmsg_sanitize_thing(duration, WXMSG_DURATION_MAX, WXMSG_DURATION_DEFAULT)},
+        WXMSG_FIELD_MILEAGE: {
+            "value": wxmsg_sanitize_character_string(mileage, WXMSG_MILEAGE_MAX, WXMSG_MILEAGE_DEFAULT)},
+    }
+
+
+def wxmsg_note_accept(uid, tmpl, trip_id="", result="accept"):
+    """小程序上报一次性订阅结果。accept 一次剩余次数 +1（同一 trip_id 不重复加）。
+    reject/ban 不增加次数，也不把「从未记账」写成 remain=0（否则会挡住微信自己的一次性额度）。"""
+    uid = str(uid or "").strip()
+    tmpl = str(tmpl or "").strip()
+    trip_id = _wxmsg_trip_id(trip_id)
+    result = str(result or "").strip().lower()
+    if not uid or not tmpl:
+        return {"remain": 0, "added": False, "tracked": False}
+    with _wxmsg_quota_lock:
+        data = _wxmsg_quota_load()
+        existing = _wxmsg_existing_slot(data, uid, tmpl)
+        if result != "accept":
+            remain = 0
+            tracked = False
+            if existing:
+                try:
+                    remain = int(existing.get("remain") or 0)
+                except (TypeError, ValueError):
+                    remain = 0
+                tracked = bool(existing.get("tracked"))
+            log_line("wxmsg", f"授权 {result or 'reject'} uid={uid} tmpl={tmpl} trip={trip_id or '-'} remain={remain}")
+            return {"remain": remain, "added": False, "tracked": tracked}
+        slot = _wxmsg_slot(data, uid, tmpl)
+        slot["tracked"] = True
+        added = False
+        if trip_id and trip_id in slot["accept_trips"]:
+            added = False
+        elif slot["remain"] >= WXMSG_QUOTA_CAP:
+            added = False
+            log_line("wxmsg", f"授权 accept 已达上限 uid={uid} remain={slot['remain']}")
+        else:
+            slot["remain"] += 1
+            added = True
+            if trip_id:
+                slot["accept_trips"].append(trip_id)
+                _wxmsg_trim(slot["accept_trips"])
+        _wxmsg_quota_save(data)
+        log_line("wxmsg", f"授权 accept uid={uid} tmpl={tmpl} trip={trip_id or '-'} added={added} remain={slot['remain']}")
+        return {"remain": slot["remain"], "added": added, "tracked": True}
+
+
+def wxmsg_prepare_send(uid, tmpl, trip_id=""):
+    """决定这次要不要打微信。
+    - 同一 trip_id 已经成功发过 → 跳过（already_sent）
+    - 小程序上报过 accept（tracked）且 remain<=0 → 跳过（no_quota），不再白打 43101
+    - 从未上报过 accept → 仍发送，交给微信「接受一次发一次」"""
+    uid = str(uid or "").strip()
+    tmpl = str(tmpl or "").strip()
+    trip_id = _wxmsg_trip_id(trip_id)
+    with _wxmsg_quota_lock:
+        slot = _wxmsg_existing_slot(_wxmsg_quota_load(), uid, tmpl)
+    if not slot:
+        return {"action": "send", "reason": None, "tracked": False, "remain": None}
+    sent = slot.get("sent_trips") if isinstance(slot.get("sent_trips"), list) else []
+    tracked = bool(slot.get("tracked"))
+    try:
+        remain = int(slot.get("remain") or 0)
+    except (TypeError, ValueError):
+        remain = 0
+    if trip_id and trip_id in sent:
+        return {"action": "skip", "reason": "already_sent", "tracked": tracked, "remain": remain if tracked else None}
+    if tracked and remain <= 0:
+        return {"action": "skip", "reason": "no_quota", "tracked": True, "remain": 0}
+    return {"action": "send", "reason": None, "tracked": tracked, "remain": remain if tracked else None}
+
+
+def wxmsg_apply_send_result(uid, tmpl, trip_id="", ok=False, errcode=None):
+    """发送结果回写额度。
+    成功且 tracked：remain -1，并记下 trip_id。
+    成功但从未上报 accept：不臆造 remain=0，只记下 trip_id 防止同一行程重发，日志标明走微信一次性语义。
+    errcode 43101 且 tracked：本地额度清零（微信侧已无次数）。其他失败不扣次数。"""
+    uid = str(uid or "").strip()
+    tmpl = str(tmpl or "").strip()
+    trip_id = _wxmsg_trip_id(trip_id)
+    try:
+        errcode = int(errcode) if errcode is not None else None
+    except (TypeError, ValueError):
+        pass
+    with _wxmsg_quota_lock:
+        data = _wxmsg_quota_load()
+        slot = _wxmsg_existing_slot(data, uid, tmpl)
+        tracked = bool(slot and slot.get("tracked"))
+        if ok:
+            if slot is None and not trip_id:
+                log_line("wxmsg", f"发送成功但未做本地额度记账，按微信一次性语义（接受一次发一次）uid={uid}")
+                return {"tracked": False, "remain": None, "decremented": False, "cleared": False}
+            slot = _wxmsg_slot(data, uid, tmpl)
+            if trip_id and trip_id in slot["sent_trips"]:
+                remain = slot["remain"] if slot.get("tracked") else None
+                return {"tracked": bool(slot.get("tracked")), "remain": remain, "decremented": False, "cleared": False}
+            decremented = False
+            if slot.get("tracked"):
+                slot["remain"] = max(0, int(slot.get("remain") or 0) - 1)
+                decremented = True
+                log_line("wxmsg", f"额度 -1 uid={uid} tmpl={tmpl} trip={trip_id or '-'} remain={slot['remain']}")
+            else:
+                log_line("wxmsg", f"发送成功但未做本地额度记账，按微信一次性语义（接受一次发一次）uid={uid} trip={trip_id or '-'}")
+            if trip_id:
+                slot["sent_trips"].append(trip_id)
+                _wxmsg_trim(slot["sent_trips"])
+            _wxmsg_quota_save(data)
+            remain = slot["remain"] if slot.get("tracked") else None
+            return {"tracked": bool(slot.get("tracked")), "remain": remain, "decremented": decremented, "cleared": False}
+        if errcode == 43101 and tracked:
+            slot = _wxmsg_slot(data, uid, tmpl)
+            slot["remain"] = 0
+            _wxmsg_quota_save(data)
+            log_line("wxmsg", f"errcode=43101 本地一次性额度清零 uid={uid} tmpl={tmpl}（用户未订阅或次数已用完）")
+            return {"tracked": True, "remain": 0, "decremented": False, "cleared": True}
+        remain = None
+        if tracked and slot:
+            try:
+                remain = int(slot.get("remain") or 0)
+            except (TypeError, ValueError):
+                remain = 0
+        return {"tracked": tracked, "remain": remain, "decremented": False, "cleared": False}
+
+
+def wxmsg_interpret_send(openid_tail, template_id, d):
+    """把微信 subscribe/send 的 JSON 收成统一结果，并写清成功 / 43101 / 其他错误。"""
+    try:
+        code = int(d.get("errcode"))
+    except (TypeError, ValueError):
+        code = d.get("errcode")
+    errmsg = str(d.get("errmsg") or "")
+    if code == 0:
+        log_line("wxmsg", f"发送成功 errcode=0 openid={openid_tail}… tmpl={template_id}")
+        return {"ok": True, "errcode": 0, "errmsg": errmsg or "ok"}
+    if code == 43101:
+        log_line(
+            "wxmsg",
+            "发送失败 errcode=43101 用户未订阅或一次性额度已用完（需在小程序再次点允许）"
+            f" openid={openid_tail}… tmpl={template_id} errmsg={errmsg}",
+        )
+    else:
+        log_line("wxmsg", f"发送失败 errcode={code} errmsg={errmsg} openid={openid_tail}… tmpl={template_id}")
+    return {"ok": False, "errcode": code, "errmsg": errmsg}
 
 # ---------- 监控大屏 ----------
 def _load_or_create_monitor_key():
@@ -3287,7 +3661,9 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._api_monitor_unbind()
         elif path == "/internal/wxmsg":
             self._internal_wxmsg()
-        elif path == "/api/mp/login":
+        elif path == "/api/wxmsg/accept":
+            self._api_wxmsg_accept()
+        elif path in ("/api/mp/login", "/api/mp_login"):
             self._api_mp_login()
         else:
             self._json(404, {"ok": False, "error": "not found"})
@@ -3348,13 +3724,19 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         return None
 
     def send_subscribe_msg(self, openid, template_id, data, page=None):
-        """发一条订阅消息。data 结构：{"key1": {"value": "v1"}, ...}。成功 True。"""
+        """发一条一次性订阅消息（cgi-bin/message/subscribe/send）。
+        返回 {"ok", "errcode", "errmsg"}。成功、43101、其他错误都写 wxmsg 日志。"""
+        tail = (openid or "")[:8]
         tok = self._wxmsg_access_token()
         if not tok:
-            return False
+            log_line("wxmsg", f"发送跳过：无 access_token（检查 MP_WX_APPID/MP_WX_SECRET）openid={tail}…")
+            return {"ok": False, "errcode": None, "errmsg": "no access_token"}
         payload = {"touser": openid, "template_id": template_id, "data": data}
         if page:
             payload["page"] = page
+        state = os.environ.get("WXMSG_MINIPROGRAM_STATE", "").strip().lower()
+        if state in ("developer", "trial", "formal"):
+            payload["miniprogram_state"] = state
         try:
             req = urllib.request.Request(
                 "https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token=" + tok,
@@ -3362,28 +3744,38 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
                 headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 d = json.loads(resp.read().decode("utf-8"))
-            if d.get("errcode") == 0:
-                return True
-            # 43101=用户未订阅/已拒收：静默；其他记日志
-            log_line("wxmsg", f"发送失败 openid={openid[:8]}… err={d.get('errcode')} {d.get('errmsg')}")
-            return False
         except Exception as e:
-            log_line("wxmsg", f"发送异常: {e}")
-            return False
+            d = None
+            if hasattr(e, "read"):
+                try:
+                    d = json.loads(e.read().decode("utf-8", "replace"))
+                except Exception:
+                    d = None
+            if not isinstance(d, dict) or "errcode" not in d:
+                log_line("wxmsg", f"发送异常 openid={tail}… tmpl={template_id} err={e}")
+                return {"ok": False, "errcode": None, "errmsg": str(e)}
+        return wxmsg_interpret_send(tail, template_id, d)
 
     def _internal_wxmsg(self):
-        """内部接口：track_watcher/digest 行程完成与周报推送订阅消息（仅 127.0.0.1）。
-        body: {"uid": "...", "title": "行程完成", "value": "12.3 km · 25 分钟", "page": "pages/home/home"}"""
+        """内部接口：行程真正结束时发一条一次性订阅消息（仅 127.0.0.1）。
+        body 推荐: {"uid","start","end","duration","mileage","page","trip_id"}
+        兼容旧字段 title/value。小程序若已 POST /api/wxmsg/accept，成功后剩余次数 -1；
+        从未上报则仍发送，按微信「接受一次发一次」，成功和失败都写日志。"""
         if not self.client_address or not str(self.client_address[0]).startswith("127."):
-            self._json(403, {"ok": False});
+            self._json(403, {"ok": False})
             return
         data = self._parse_json() or {}
         uid = str(data.get("uid") or "")
-        title = str(data.get("title") or "通知")
+        start = str(data.get("start") or "")
+        end = str(data.get("end") or "")
+        duration = str(data.get("duration") or "")
+        mileage = str(data.get("mileage") or "")
+        title = str(data.get("title") or "")
         value = str(data.get("value") or "")
         page = data.get("page") or "pages/home/home"
+        trip_id = str(data.get("trip_id") or "")
         if not uid:
-            self._json(400, {"ok": False, "error": "missing uid"});
+            self._json(400, {"ok": False, "error": "missing uid"})
             return
         try:
             codes = load_codes()
@@ -3391,27 +3783,88 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         except Exception:
             openid = ""
         if not openid:
-            self._json(200, {"ok": True, "sent": False, "reason": "no openid"});
+            self._json(200, {"ok": True, "sent": False, "reason": "no openid"})
             return
-        now_s = datetime.now().strftime("%m月%d日 %H:%M")
-        sent = self.send_subscribe_msg(openid, WXMSG_TRIP_TMPL, {
-            "thing1": {"value": title[:20]},
-            "thing2": {"value": value[:20]},
-            "time3": {"value": now_s},
-        }, page)
-        self._json(200, {"ok": True, "sent": bool(sent)})
+        prep = wxmsg_prepare_send(uid, WXMSG_TRIP_TMPL, trip_id)
+        if prep["action"] == "skip":
+            log_line("wxmsg", f"跳过发送 uid={uid} trip={_wxmsg_trip_id(trip_id) or '-'} reason={prep['reason']} remain={prep.get('remain')}")
+            self._json(200, {"ok": True, "sent": False, "reason": prep["reason"], "remain": prep.get("remain")})
+            return
+        card = wxmsg_trip_payload(
+            start=start, end=end, duration=duration, mileage=mileage,
+            title=title, value=value)
+        result = self.send_subscribe_msg(openid, WXMSG_TRIP_TMPL, card, page)
+        applied = wxmsg_apply_send_result(
+            uid, WXMSG_TRIP_TMPL, trip_id, ok=bool(result.get("ok")), errcode=result.get("errcode"))
+        body = {"ok": True, "sent": bool(result.get("ok")), "errcode": result.get("errcode")}
+        if applied.get("tracked"):
+            body["remain"] = applied.get("remain")
+        if not result.get("ok"):
+            body["reason"] = "43101" if result.get("errcode") == 43101 else "wechat"
+        self._json(200, body)
+
+    def _api_wxmsg_accept(self):
+        """小程序在「行程回顾 / 行程详情」里 wx.requestSubscribeMessage 之后上报。
+        body: {token? 或 Authorization Bearer, tmpl?, trip_id?, result: accept|reject|ban, openid?}
+        openid 必须已由 mp_login 绑到会话 uid；若 body 带了 openid，只做一致性校验，不回传。
+        个人主体一次性订阅：accept 一次该模板 +1，发送成功再 -1。"""
+        ip = self.client_address[0] if self.client_address else "?"
+        if not self._rate_ok("wxmsg:" + ip):
+            self._json(429, {"ok": False, "error": "尝试过于频繁，请稍后再试"})
+            return
+        data = self._parse_json() or {}
+        tok = str(data.get("token") or "").strip()
+        if not tok:
+            h = self.headers.get("Authorization", "")
+            if h.startswith("Bearer "):
+                tok = h[7:].strip()
+        sess = check_session(tok) if tok else None
+        if not sess or not sess.get("uid"):
+            self._json(401, {"ok": False, "error": "未登录或会话过期"})
+            return
+        uid = sess["uid"]
+        tmpl = str(data.get("tmpl") or WXMSG_TRIP_TMPL).strip()
+        if tmpl != WXMSG_TRIP_TMPL:
+            self._json(400, {"ok": False, "error": "仅支持当前配置的行程一次性模板"})
+            return
+        result = str(data.get("result") or "").strip().lower()
+        if result not in ("accept", "reject", "ban"):
+            self._json(400, {"ok": False, "error": "result 需为 accept、reject 或 ban"})
+            return
+        raw_trip = str(data.get("trip_id") or "").strip()
+        trip_id = _wxmsg_trip_id(raw_trip)
+        if raw_trip and not trip_id:
+            self._json(400, {"ok": False, "error": "trip_id 仅允许字母数字、下划线、连字符，最长 64"})
+            return
+        try:
+            codes = load_codes()
+            bound = (codes.get(uid) or {}).get("openid") or ""
+        except Exception:
+            bound = ""
+        reported = str(data.get("openid") or "").strip()
+        if reported and bound and reported != bound:
+            log_line("wxmsg", f"授权拒绝：openid 与已绑定不一致 uid={uid}")
+            self._json(403, {"ok": False, "error": "openid 与当前账号不一致"})
+            return
+        if not bound:
+            self._json(409, {"ok": False, "error": "尚未绑定 openid，请先调用 mp_login"})
+            return
+        noted = wxmsg_note_accept(uid, tmpl, trip_id, result)
+        self._json(200, {
+            "ok": True, "result": result, "remain": noted["remain"],
+            "added": noted["added"], "tmpl": tmpl,
+        })
 
     def _api_mp_login(self):
-        """wx.login 的 code 换 openid 并落到 uid。未配置 AppID/Secret 时为 mock 模式：
-        用 code 派生伪 openid，供小程序壳无凭据联调；配置后自动走 code2session 真换。
-        uid 以 openid 哈希生成，档案落 friends-codes.json（与 H5 自助注册同构），
-        openid 本身不回传客户端。"""
+        """wx.login 的 code 换 openid。优先用会话 token 绑到已登录邮箱 uid（供行程订阅推送）；
+        无有效会话时回落为 MP* uid（兼容旧 /api/mp/login）。
+        未配置 AppID/Secret 时为 mock 模式。openid 本身不回传客户端。"""
         ip = self.client_address[0] if self.client_address else "?"
         if not self._rate_ok("mplogin:" + ip):
             self._json(429, {"ok": False, "error": "尝试过于频繁，请稍后再试"})
             return
-        data = self._parse_json()
-        if not data or not str(data.get("code", "")).strip():
+        data = self._parse_json() or {}
+        if not str(data.get("code", "")).strip():
             self._json(400, {"ok": False, "error": "缺少 code"})
             return
         code = str(data["code"]).strip()
@@ -3434,13 +3887,29 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         if not openid:
             self._json(402, {"ok": False, "error": "微信登录失败，请重试"})
             return
-        uid = "MP" + hashlib.sha1(openid.encode("utf-8")).hexdigest()[:10].upper()
+        # 会话绑定：body.token 或 Authorization Bearer → 邮箱 uid
+        tok = str(data.get("token") or "").strip()
+        if not tok:
+            h = self.headers.get("Authorization", "")
+            if h.startswith("Bearer "):
+                tok = h[7:].strip()
+        sess = check_session(tok) if tok else None
         codes = load_codes()
+        if sess and sess.get("uid"):
+            uid = sess["uid"]
+            if uid not in codes:
+                codes[uid] = {"name": sess.get("name") or ("用户 " + uid[-4:]), "enabled": True}
+            codes[uid]["openid"] = openid
+            save_codes(codes)
+            log_line("mplogin", f"绑定 openid→uid={uid} mock={is_mock}")
+            self._json(200, {"ok": True, "uid": uid, "mock": is_mock, "bound": True})
+            return
+        # 无会话：旧路径，按 openid 派生 MP* uid
+        uid = "MP" + hashlib.sha1(openid.encode("utf-8")).hexdigest()[:10].upper()
         if uid not in codes:
             codes[uid] = {"name": "小程序用户 " + uid[-4:], "enabled": True}
             save_codes(codes)
             log_line("mplogin", f"新建小程序用户档案: {uid}")
-        # 订阅消息依赖：openid 落档案（与邮箱 uid 关联后可按邮箱身份发）
         if not is_mock:
             try:
                 codes[uid]["openid"] = openid
