@@ -71,6 +71,32 @@ AMAP_MAP_SEM = threading.BoundedSemaphore(1)
 MP_WX_APPID = os.environ.get("MP_WX_APPID", "")
 _WXMSG_TOKEN = {"tok": "", "ts": 0}   # 订阅消息 access_token 进程级缓存
 WXMSG_TRIP_TMPL = "zErBRh7BVm9q7SEJe8FpINXm0qg8Af5oDNHCsMrSDxM"   # 行程通知订阅模板
+# 充电结束通知（一次性订阅；场景说明「充电提醒」固定，不发送）
+def _wxmsg_env_str(name, default):
+    v = str(os.environ.get(name, "") or "").strip()
+    return v or default
+
+def _wxmsg_env_int(name, default):
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+        return n if n > 0 else default
+    except Exception:
+        return default
+
+WXMSG_CHARGE_TMPL = _wxmsg_env_str(
+    "WXMSG_CHARGE_TMPL", "gWvIgcvnYLgjvkrNt9wtVrdR4L-j3M18nylRyv8IEPg")
+WXMSG_CHARGE_FIELD_DURATION = _wxmsg_env_str("WXMSG_CHARGE_FIELD_DURATION", "time3")
+WXMSG_CHARGE_FIELD_ENERGY = _wxmsg_env_str("WXMSG_CHARGE_FIELD_ENERGY", "character_string4")
+WXMSG_CHARGE_FIELD_END = _wxmsg_env_str("WXMSG_CHARGE_FIELD_END", "time2")
+WXMSG_CHARGE_ENERGY_MAX = _wxmsg_env_int("WXMSG_CHARGE_ENERGY_MAX", 32)
+WXMSG_CHARGE_ENERGY_DEFAULT = _wxmsg_env_str("WXMSG_CHARGE_ENERGY_DEFAULT", "0kWh")
+# 本地记账上限。微信侧仍是「允许一次发一次」；这里只是不把自家账本封在很小的数上。
+WXMSG_CHARGE_QUOTA_CAP = _wxmsg_env_int("WXMSG_CHARGE_QUOTA_CAP", 9999)
+WXMSG_QUOTA_FILE = os.path.join(BASE, "wxmsg-quota.json")
+_wxmsg_quota_lock = threading.Lock()
 MP_WX_SECRET = os.environ.get("MP_WX_SECRET", "")
 
 VOICE_SILENCE_HALLUCINATIONS = {"我", "嗯", "啊", "呃", "额", "哦"}
@@ -668,6 +694,253 @@ def log_line(kind, msg):
             f.write(f"[{now_iso()}] {kind}: {msg}\n")
     except Exception:
         pass
+
+
+def _wxmsg_epoch(ts):
+    """秒或毫秒 → 秒。无效返回 None。"""
+    if ts is None or ts == "":
+        return None
+    try:
+        n = float(ts)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    if n > 1e12:
+        n = n / 1000.0
+    return n
+
+
+def _wxmsg_errcode(code):
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wxmsg_soc_delta(soc_start, soc_end):
+    if soc_start is None or soc_start == "" or soc_end is None or soc_end == "":
+        return None
+    try:
+        return float(soc_end) - float(soc_start)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wxmsg_charge_energy(kwh, soc_delta, max_len=None):
+    """充入电量：优先 kWh，其次 +SOC%，都没有用 0kWh。去掉汉字，限长。"""
+    max_len = max(1, int(max_len or WXMSG_CHARGE_ENERGY_MAX or 32))
+    energy = ""
+    if kwh is not None and str(kwh).strip() != "":
+        text = str(kwh).strip().replace("千瓦时", "kWh").replace("度", "")
+        text = re.sub(r"[^\x00-\x7F]", "", text)
+        m = re.search(r"[+-]?\d+(?:\.\d+)?", text)
+        if m:
+            try:
+                energy = "%.1fkWh" % round(float(m.group(0)), 1)
+            except (TypeError, ValueError):
+                energy = ""
+        if not energy:
+            energy = re.sub(r"[^0-9A-Za-z.+%-]", "", text)
+            if energy and not energy.endswith("kWh") and re.fullmatch(r"[+-]?\d+(?:\.\d+)?", energy):
+                energy = energy + "kWh"
+    if not energy and soc_delta is not None and str(soc_delta).strip() != "":
+        try:
+            n = int(round(float(soc_delta)))
+            energy = ("+%d%%" % n) if n >= 0 else ("%d%%" % n)
+        except (TypeError, ValueError):
+            raw = re.sub(r"[^\x00-\x7F]", "", str(soc_delta))
+            energy = re.sub(r"[^0-9A-Za-z.+%-]", "", raw)
+    if not energy:
+        energy = WXMSG_CHARGE_ENERGY_DEFAULT or "0kWh"
+    energy = re.sub(r"[^\x00-\x7F]", "", str(energy))
+    energy = re.sub(r"[^0-9A-Za-z.+%-]", "", energy)
+    if not energy:
+        energy = "0kWh"
+    return energy[:max_len] or "0kWh"
+
+
+def wxmsg_charge_payload(start_ts, end_ts, kwh=None, soc_delta=None, now=None):
+    """充电结束通知字段。time3 只能是时间点或「开始~结束」，禁止「35分钟」。
+    character_string4 无汉字。场景说明不在这里发。"""
+    end_epoch = _wxmsg_epoch(end_ts)
+    if end_epoch is None:
+        end_epoch = _wxmsg_epoch(now) or time.time()
+    start_epoch = _wxmsg_epoch(start_ts)
+    end_s = time.strftime("%Y-%m-%d %H:%M", time.localtime(end_epoch))
+    if start_epoch is not None:
+        start_s = time.strftime("%Y-%m-%d %H:%M", time.localtime(start_epoch))
+        duration = "%s~%s" % (start_s, end_s)
+    else:
+        duration = end_s
+    energy = _wxmsg_charge_energy(kwh, soc_delta)
+    return {
+        WXMSG_CHARGE_FIELD_DURATION: {"value": duration},
+        WXMSG_CHARGE_FIELD_ENERGY: {"value": energy},
+        WXMSG_CHARGE_FIELD_END: {"value": end_s},
+    }
+
+
+def _wxmsg_quota_load():
+    try:
+        with open(WXMSG_QUOTA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _wxmsg_quota_save(data):
+    try:
+        os.makedirs(os.path.dirname(WXMSG_QUOTA_FILE) or ".", exist_ok=True)
+        tmp = WXMSG_QUOTA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, WXMSG_QUOTA_FILE)
+    except Exception as e:
+        log_line("wxmsg", f"额度写入失败: {e}")
+
+
+def _wxmsg_charge_slot(data, uid, tmpl, create=False):
+    """按 uid + 模板 ID 分账。create=False 时没有账本就返回 None。"""
+    user = data.get(uid)
+    if not isinstance(user, dict):
+        if not create:
+            return None
+        user = {}
+        data[uid] = user
+    tmpls = user.get("tmpls")
+    if not isinstance(tmpls, dict):
+        if not create:
+            return None
+        tmpls = {}
+        user["tmpls"] = tmpls
+    slot = tmpls.get(tmpl)
+    if not isinstance(slot, dict):
+        if not create:
+            return None
+        slot = {"tracked": False, "remain": 0, "sent_ids": [], "accept_ids": []}
+        tmpls[tmpl] = slot
+    if not isinstance(slot.get("sent_ids"), list):
+        slot["sent_ids"] = []
+    if not isinstance(slot.get("accept_ids"), list):
+        slot["accept_ids"] = []
+    slot["tracked"] = bool(slot.get("tracked"))
+    try:
+        slot["remain"] = int(slot.get("remain") or 0)
+    except (TypeError, ValueError):
+        slot["remain"] = 0
+    if slot["remain"] < 0:
+        slot["remain"] = 0
+    return slot
+
+
+def _wxmsg_trim(seq, cap=40):
+    if len(seq) > cap:
+        del seq[:-cap]
+
+
+def wxmsg_charge_session_key(session_id, start_ts):
+    """同一充电会话的去重键：优先 session_id，否则用 start_ts 的整秒。"""
+    sid = str(session_id or "").strip()
+    if sid and len(sid) <= 64 and re.fullmatch(r"[A-Za-z0-9_.:\-]+", sid):
+        return sid
+    epoch = _wxmsg_epoch(start_ts)
+    if epoch is None:
+        return ""
+    return str(int(epoch))
+
+
+def wxmsg_charge_note_accept(uid, tmpl, result="accept", accept_id=""):
+    """一次性订阅上报。accept +1，上限 WXMSG_CHARGE_QUOTA_CAP（默认 9999）。
+    同一 accept_id 不重复加。reject/ban/filter 不加，也不把未记账写成 0。"""
+    uid = str(uid or "").strip()
+    tmpl = str(tmpl or "").strip()
+    result = str(result or "").strip().lower()
+    accept_id = str(accept_id or "").strip()
+    if accept_id and not re.fullmatch(r"[A-Za-z0-9_.:\-]{1,64}", accept_id):
+        accept_id = ""
+    if not uid or not tmpl:
+        return {"remain": 0, "added": False, "tracked": False}
+    with _wxmsg_quota_lock:
+        data = _wxmsg_quota_load()
+        existing = _wxmsg_charge_slot(data, uid, tmpl, create=False)
+        if result != "accept":
+            remain = int(existing.get("remain") or 0) if existing else 0
+            tracked = bool(existing.get("tracked")) if existing else False
+            return {"remain": remain, "added": False, "tracked": tracked}
+        slot = _wxmsg_charge_slot(data, uid, tmpl, create=True)
+        slot["tracked"] = True
+        if accept_id and accept_id in slot["accept_ids"]:
+            return {"remain": slot["remain"], "added": False, "tracked": True}
+        cap = int(WXMSG_CHARGE_QUOTA_CAP or 9999)
+        if slot["remain"] >= cap:
+            _wxmsg_quota_save(data)
+            return {"remain": slot["remain"], "added": False, "tracked": True, "capped": True}
+        slot["remain"] += 1
+        if accept_id:
+            slot["accept_ids"].append(accept_id)
+            _wxmsg_trim(slot["accept_ids"])
+        _wxmsg_quota_save(data)
+        return {"remain": slot["remain"], "added": True, "tracked": True}
+
+
+def wxmsg_charge_prepare(uid, tmpl, session_key):
+    """决定要不要发。同一 session 已成功发过 → duplicate。
+    记账过且剩余 0 → no_quota（43101 之后不再轰炸）。从未记账仍发送。"""
+    uid = str(uid or "").strip()
+    tmpl = str(tmpl or "").strip()
+    session_key = str(session_key or "")
+    with _wxmsg_quota_lock:
+        slot = _wxmsg_charge_slot(_wxmsg_quota_load(), uid, tmpl, create=False)
+        if not slot:
+            return {"action": "send", "reason": "", "tracked": False, "remain": None}
+        sent = [str(x) for x in slot.get("sent_ids") or []]
+        if session_key and session_key in sent:
+            return {"action": "skip", "reason": "duplicate", "tracked": bool(slot.get("tracked")),
+                    "remain": slot.get("remain")}
+        if slot.get("tracked") and int(slot.get("remain") or 0) <= 0:
+            return {"action": "skip", "reason": "no_quota", "tracked": True, "remain": 0}
+        remain = slot.get("remain") if slot.get("tracked") else None
+        return {"action": "send", "reason": "", "tracked": bool(slot.get("tracked")), "remain": remain}
+
+
+def wxmsg_charge_apply_send(uid, tmpl, session_key, ok=False, errcode=None):
+    """发送结果落账。成功：按模板扣 1 次（若已记账）并记下 session，避免同会话再发。
+    43101：该模板清零，日志写明需要再授权，不重试。其他失败不扣、不去重。"""
+    uid = str(uid or "").strip()
+    tmpl = str(tmpl or "").strip()
+    session_key = str(session_key or "")
+    code = _wxmsg_errcode(errcode)
+    with _wxmsg_quota_lock:
+        data = _wxmsg_quota_load()
+        if ok:
+            slot = _wxmsg_charge_slot(data, uid, tmpl, create=True)
+            decremented = False
+            if slot.get("tracked") and slot["remain"] > 0:
+                slot["remain"] -= 1
+                decremented = True
+            if session_key and session_key not in slot["sent_ids"]:
+                slot["sent_ids"].append(session_key)
+                _wxmsg_trim(slot["sent_ids"])
+            _wxmsg_quota_save(data)
+            remain = slot["remain"] if slot.get("tracked") else None
+            return {"tracked": bool(slot.get("tracked")), "remain": remain,
+                    "decremented": decremented, "cleared": False}
+        if code == 43101:
+            slot = _wxmsg_charge_slot(data, uid, tmpl, create=True)
+            slot["tracked"] = True
+            slot["remain"] = 0
+            _wxmsg_quota_save(data)
+            log_line("wxmsg", "errcode=43101 充电模板本地额度清零 uid=%s tmpl=%s（用户需再授权，不重试）" % (uid, tmpl))
+            return {"tracked": True, "remain": 0, "decremented": False, "cleared": True}
+        slot = _wxmsg_charge_slot(data, uid, tmpl, create=False)
+        remain = None
+        tracked = False
+        if slot:
+            tracked = bool(slot.get("tracked"))
+            remain = slot.get("remain") if tracked else None
+        return {"tracked": tracked, "remain": remain, "decremented": False, "cleared": False}
 
 
 _state_diag_last = {}
@@ -3287,6 +3560,8 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             self._api_monitor_unbind()
         elif path == "/internal/wxmsg":
             self._internal_wxmsg()
+        elif path == "/api/wxmsg/accept":
+            self._api_wxmsg_accept()
         elif path == "/api/mp/login":
             self._api_mp_login()
         else:
@@ -3349,12 +3624,19 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
 
     def send_subscribe_msg(self, openid, template_id, data, page=None):
         """发一条订阅消息。data 结构：{"key1": {"value": "v1"}, ...}。成功 True。"""
+        return bool(self._subscribe_send_result(openid, template_id, data, page).get("ok"))
+
+    def _subscribe_send_result(self, openid, template_id, data, page=None):
+        """同 send_subscribe_msg，但带回 errcode（充电额度要认 43101）。"""
         tok = self._wxmsg_access_token()
         if not tok:
-            return False
+            return {"ok": False, "errcode": None, "errmsg": "no access_token"}
         payload = {"touser": openid, "template_id": template_id, "data": data}
         if page:
             payload["page"] = page
+        state = os.environ.get("WXMSG_MINIPROGRAM_STATE", "").strip().lower()
+        if state in ("developer", "trial", "formal"):
+            payload["miniprogram_state"] = state
         try:
             req = urllib.request.Request(
                 "https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token=" + tok,
@@ -3363,21 +3645,24 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             with urllib.request.urlopen(req, timeout=8) as resp:
                 d = json.loads(resp.read().decode("utf-8"))
             if d.get("errcode") == 0:
-                return True
-            # 43101=用户未订阅/已拒收：静默；其他记日志
+                return {"ok": True, "errcode": 0, "errmsg": d.get("errmsg") or "ok"}
             log_line("wxmsg", f"发送失败 openid={openid[:8]}… err={d.get('errcode')} {d.get('errmsg')}")
-            return False
+            return {"ok": False, "errcode": d.get("errcode"), "errmsg": d.get("errmsg")}
         except Exception as e:
             log_line("wxmsg", f"发送异常: {e}")
-            return False
+            return {"ok": False, "errcode": None, "errmsg": str(e)}
 
     def _internal_wxmsg(self):
-        """内部接口：track_watcher/digest 行程完成与周报推送订阅消息（仅 127.0.0.1）。
-        body: {"uid": "...", "title": "行程完成", "value": "12.3 km · 25 分钟", "page": "pages/home/home"}"""
+        """内部接口：仅 127.0.0.1。
+        kind 缺省 / trip：行程完成（原逻辑）。
+        kind=charge：充电结束通知。失败只记日志，由调用方决定不中断聊天。"""
         if not self.client_address or not str(self.client_address[0]).startswith("127."):
             self._json(403, {"ok": False});
             return
         data = self._parse_json() or {}
+        if str(data.get("kind") or "").strip().lower() == "charge":
+            self._internal_wxmsg_charge(data)
+            return
         uid = str(data.get("uid") or "")
         title = str(data.get("title") or "通知")
         value = str(data.get("value") or "")
@@ -3400,6 +3685,91 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             "time3": {"value": now_s},
         }, page)
         self._json(200, {"ok": True, "sent": bool(sent)})
+
+    def _internal_wxmsg_charge(self, data):
+        """充满/达限额（kind=charge）。模板按 WXMSG_CHARGE_*；按模板分账；同 session 只发一次。"""
+        uid = str(data.get("uid") or "").strip()
+        if not uid:
+            self._json(400, {"ok": False, "error": "missing uid"})
+            return
+        try:
+            openid = (load_codes().get(uid) or {}).get("openid") or ""
+        except Exception:
+            openid = ""
+        if not openid:
+            self._json(200, {"ok": True, "sent": False, "reason": "no openid"})
+            return
+        session_key = wxmsg_charge_session_key(data.get("session_id"), data.get("start_ts"))
+        prep = wxmsg_charge_prepare(uid, WXMSG_CHARGE_TMPL, session_key)
+        if prep.get("action") == "skip":
+            log_line("wxmsg", "充电跳过 uid=%s session=%s reason=%s" % (
+                uid, session_key or "-", prep.get("reason")))
+            self._json(200, {"ok": True, "sent": False, "reason": prep.get("reason"),
+                             "remain": prep.get("remain")})
+            return
+        soc_delta = data.get("soc_delta")
+        if soc_delta is None:
+            soc_delta = _wxmsg_soc_delta(data.get("soc_start"), data.get("soc_end"))
+        kwh = data.get("kwh") if isinstance(data, dict) and "kwh" in data else None
+        card = wxmsg_charge_payload(data.get("start_ts"), data.get("end_ts"), kwh=kwh, soc_delta=soc_delta)
+        page = data.get("page") or "pages/home/home"
+        result = self._subscribe_send_result(openid, WXMSG_CHARGE_TMPL, card, page)
+        applied = wxmsg_charge_apply_send(
+            uid, WXMSG_CHARGE_TMPL, session_key,
+            ok=bool(result.get("ok")), errcode=result.get("errcode"))
+        body = {"ok": True, "sent": bool(result.get("ok")), "errcode": result.get("errcode")}
+        if applied.get("remain") is not None:
+            body["remain"] = applied.get("remain")
+        if not result.get("ok"):
+            body["reason"] = "43101" if _wxmsg_errcode(result.get("errcode")) == 43101 else "wechat"
+            log_line("wxmsg", "充电发送未成功 uid=%s session=%s reason=%s" % (
+                uid, session_key or "-", body["reason"]))
+        self._json(200, body)
+
+    def _api_wxmsg_accept(self):
+        """小程序 wx.requestSubscribeMessage 之后上报。按模板 ID 分账，充电默认模板。
+        body: {token 或 Authorization Bearer, tmpl?, result: accept|reject|ban|filter, accept_id?}
+        openid 必须已由 mp_login 绑上；body 里的 openid 只做一致性校验，不回传。"""
+        ip = self.client_address[0] if self.client_address else "?"
+        if not self._rate_ok("wxmsg:" + ip):
+            self._json(429, {"ok": False, "error": "尝试过于频繁，请稍后再试"})
+            return
+        data = self._parse_json() or {}
+        tok = str(data.get("token") or "").strip()
+        if not tok:
+            h = self.headers.get("Authorization", "")
+            if h.startswith("Bearer "):
+                tok = h[7:].strip()
+        sess = check_session(tok) if tok else None
+        if not sess or not sess.get("uid"):
+            self._json(401, {"ok": False, "error": "未登录或会话过期"})
+            return
+        uid = sess["uid"]
+        tmpl = str(data.get("tmpl") or WXMSG_CHARGE_TMPL).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{8,80}", tmpl):
+            self._json(400, {"ok": False, "error": "tmpl 无效"})
+            return
+        result = str(data.get("result") or "").strip().lower()
+        if result not in ("accept", "reject", "ban", "filter"):
+            self._json(400, {"ok": False, "error": "result 需为 accept、reject、ban 或 filter"})
+            return
+        try:
+            bound = (load_codes().get(uid) or {}).get("openid") or ""
+        except Exception:
+            bound = ""
+        reported = str(data.get("openid") or "").strip()
+        if reported and bound and reported != bound:
+            log_line("wxmsg", f"授权拒绝：openid 与已绑定不一致 uid={uid}")
+            self._json(403, {"ok": False, "error": "openid 与当前账号不一致"})
+            return
+        if not bound:
+            self._json(409, {"ok": False, "error": "尚未绑定 openid，请先调用 mp_login"})
+            return
+        noted = wxmsg_charge_note_accept(uid, tmpl, result, data.get("accept_id") or data.get("session_id") or "")
+        self._json(200, {
+            "ok": True, "result": result, "remain": noted["remain"],
+            "added": noted["added"], "tmpl": tmpl,
+        })
 
     def _api_mp_login(self):
         """wx.login 的 code 换 openid 并落到 uid。未配置 AppID/Secret 时为 mock 模式：
