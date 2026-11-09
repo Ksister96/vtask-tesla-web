@@ -21,28 +21,55 @@ LOGS = []
 m.log_line = lambda kind, msg: LOGS.append((kind, msg))
 
 TMPL = m.WXMSG_TRIP_TMPL
+PHRASE = m.WXMSG_FIELD_PHRASE
+THING = m.WXMSG_FIELD_THING
+PHRASE_MAX = m.WXMSG_PHRASE_MAX
+THING_MAX = m.WXMSG_THING_MAX
+PHRASE_DEF = m.WXMSG_PHRASE_DEFAULT
+THING_DEF = m.WXMSG_THING_DEFAULT
 
 
 def logs_text():
     return "\n".join(msg for _, msg in LOGS)
 
 
-# 文案：phrase1「行程结束」≤5 字，thing12 简述 ≤20 字；空值/商标有兜底；不传 time
-p = m.wxmsg_trip_payload("行程结束", "12.3 km · 25 分钟")
-assert p["phrase1"]["value"] == "行程结束"
-assert p["thing12"]["value"] == "12.3 km · 25 分钟"
-assert set(p.keys()) == {"phrase1", "thing12"}
+# 文案：字段名/长度/默认文案一律读 WXMSG_* 配置；空值/商标有兜底；不传 time
+assert PHRASE == "phrase1" and THING == "thing12"
+assert PHRASE_MAX == 5 and THING_MAX == 20
+assert PHRASE_DEF == "行程结束" and THING_DEF == "已到达"
+p = m.wxmsg_trip_payload(PHRASE_DEF, "12.3 km · 25 分钟")
+assert p[PHRASE]["value"] == PHRASE_DEF
+assert p[THING]["value"] == "12.3 km · 25 分钟"
+assert set(p.keys()) == {PHRASE, THING}
 assert "特斯拉" not in json.dumps(p, ensure_ascii=False)
 p = m.wxmsg_trip_payload("特斯拉行程结束", "Tesla 12km")
-assert p["phrase1"]["value"] == "行程结束"
-assert p["thing12"]["value"] == "行程已结束"
-p = m.wxmsg_trip_payload("已到达啦啦", "说明" * 30)
-assert p["phrase1"]["value"] == "已到达啦啦"[:5]
-assert len(p["phrase1"]["value"]) == 5
-assert len(p["thing12"]["value"]) == 20
+assert p[PHRASE]["value"] == PHRASE_DEF
+assert p[THING]["value"] == THING_DEF
+long_phrase = "已到达啦啦"
+p = m.wxmsg_trip_payload(long_phrase, "说明" * 30)
+assert p[PHRASE]["value"] == long_phrase[:PHRASE_MAX]
+assert len(p[PHRASE]["value"]) == PHRASE_MAX
+assert len(p[THING]["value"]) == THING_MAX
 p = m.wxmsg_trip_payload("", "")
-assert p["phrase1"]["value"] == "行程结束"
-assert p["thing12"]["value"] == "行程已结束"
+assert p[PHRASE]["value"] == PHRASE_DEF
+assert p[THING]["value"] == THING_DEF
+# 运行时改配置应立刻生效（换模板只改一处）
+m.WXMSG_FIELD_PHRASE = "thing1"
+m.WXMSG_FIELD_THING = "thing2"
+m.WXMSG_PHRASE_MAX = 4
+m.WXMSG_THING_MAX = 8
+m.WXMSG_PHRASE_DEFAULT = "已到达"
+m.WXMSG_THING_DEFAULT = "终点附近"
+alt = m.wxmsg_trip_payload("", "ABCDEFGHIJK")
+assert set(alt.keys()) == {"thing1", "thing2"}
+assert alt["thing1"]["value"] == "已到达"
+assert alt["thing2"]["value"] == "ABCDEFGH"
+m.WXMSG_FIELD_PHRASE = PHRASE
+m.WXMSG_FIELD_THING = THING
+m.WXMSG_PHRASE_MAX = PHRASE_MAX
+m.WXMSG_THING_MAX = THING_MAX
+m.WXMSG_PHRASE_DEFAULT = PHRASE_DEF
+m.WXMSG_THING_DEFAULT = THING_DEF
 
 # accept +1；同一 trip 不重复加；无 trip_id 的另一次再 +1
 a = m.wxmsg_note_accept("u1", TMPL, "tripA", "accept")
@@ -136,15 +163,15 @@ m._WXMSG_TOKEN["tok"] = "tok"
 m._WXMSG_TOKEN["ts"] = 10**12
 os.environ["WXMSG_MINIPROGRAM_STATE"] = "developer"
 SEEN["resp"] = {"errcode": 0, "errmsg": "ok"}
-card = m.wxmsg_trip_payload("行程结束", "12.3 km · 25 分钟")
+card = m.wxmsg_trip_payload(PHRASE_DEF, "12.3 km · 25 分钟")
 ok = m.Handler.send_subscribe_msg(_SendStub(), "openid-ABCDEFGH", TMPL, card, "pages/home/home")
 assert ok["ok"] and ok["errcode"] == 0, ok
 assert "cgi-bin/message/subscribe/send" in SEEN["url"]
 assert SEEN["body"]["miniprogram_state"] == "developer"
-assert SEEN["body"]["data"]["phrase1"]["value"] == "行程结束"
-assert SEEN["body"]["data"]["thing12"]["value"] == "12.3 km · 25 分钟"
-assert "thing1" not in SEEN["body"]["data"]
+assert SEEN["body"]["data"][PHRASE]["value"] == PHRASE_DEF
+assert SEEN["body"]["data"][THING]["value"] == "12.3 km · 25 分钟"
 assert "time3" not in SEEN["body"]["data"]
+assert set(SEEN["body"]["data"].keys()) == {PHRASE, THING}
 assert "发送成功 errcode=0" in logs_text()
 
 SEEN["resp"] = {"errcode": 43101, "errmsg": "user refuse to accept the msg"}
@@ -174,7 +201,7 @@ miss = m.Handler.send_subscribe_msg(_SendStub(), "openid-ABCDEFGH", TMPL, card)
 assert miss["ok"] is False and miss["errmsg"] == "no access_token", miss
 assert "无 access_token" in logs_text()
 
-# settle_trip 把行程号和「行程结束」交给本机接口，失败只记日志
+# settle_trip 把行程号和 phrase 默认文案交给本机接口，失败只记日志
 import track_watcher_multi as tw
 
 posted = {}
@@ -205,7 +232,7 @@ tw.settle_trip("t1", [
     {"ts": t0 + 181000, "lat": 31.3, "lon": 121.6, "gear": "P", "spd": 0, "odo": 12.5},
 ])
 assert posted["url"].endswith("/internal/wxmsg"), posted
-assert posted["body"]["title"] == "行程结束"
+assert posted["body"]["title"] == PHRASE_DEF
 assert posted["body"]["uid"] == "t1"
 assert posted["body"]["trip_id"]
 assert "特斯拉" not in posted["body"]["title"]

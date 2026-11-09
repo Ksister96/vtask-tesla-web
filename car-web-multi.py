@@ -70,7 +70,30 @@ AMAP_MAP_SEM = threading.BoundedSemaphore(1)
 # 小程序（微信）凭据：环境变量注入；两者齐备走真 code2session，缺省为 mock 模式
 MP_WX_APPID = os.environ.get("MP_WX_APPID", "")
 _WXMSG_TOKEN = {"tok": "", "ts": 0}   # 订阅消息 access_token 进程级缓存
-WXMSG_TRIP_TMPL = "zErBRh7BVm9q7SEJe8FpINXm0qg8Af5oDNHCsMrSDxM"   # 行程完成一次性订阅模板（个人主体；非长期、非设备）
+# 行程一次性订阅（个人主体；换模板只改这里或对应环境变量，不要散落硬编码）
+# 现网默认：车辆状态提醒 27866 → phrase1 + thing12
+def _wxmsg_env_str(name, default):
+    v = str(os.environ.get(name, "") or "").strip()
+    return v or default
+
+def _wxmsg_env_int(name, default):
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+        return n if n > 0 else default
+    except Exception:
+        return default
+
+WXMSG_TRIP_TMPL = _wxmsg_env_str(
+    "WXMSG_TRIP_TMPL", "zErBRh7BVm9q7SEJe8FpINXm0qg8Af5oDNHCsMrSDxM")
+WXMSG_FIELD_PHRASE = _wxmsg_env_str("WXMSG_FIELD_PHRASE", "phrase1")
+WXMSG_FIELD_THING = _wxmsg_env_str("WXMSG_FIELD_THING", "thing12")
+WXMSG_PHRASE_MAX = _wxmsg_env_int("WXMSG_PHRASE_MAX", 5)
+WXMSG_THING_MAX = _wxmsg_env_int("WXMSG_THING_MAX", 20)
+WXMSG_PHRASE_DEFAULT = _wxmsg_env_str("WXMSG_PHRASE_DEFAULT", "行程结束")
+WXMSG_THING_DEFAULT = _wxmsg_env_str("WXMSG_THING_DEFAULT", "已到达")
 WXMSG_QUOTA_FILE = os.path.join(BASE, "wxmsg-quota.json")         # 本地一次性额度：accept +1，发送成功 -1
 WXMSG_QUOTA_CAP = 20
 _wxmsg_quota_lock = threading.Lock()
@@ -868,20 +891,20 @@ def _wxmsg_trim(seq, cap=40):
 
 
 def wxmsg_trip_payload(title, value, when_s=None):
-    """订阅卡片字段（模板「车辆状态提醒」27866）：
-    phrase1=车辆状态（≤5 汉字，默认「行程结束」）；thing12=当前车位/简述（≤20 字）。
-    第三行场景说明固定，不传变量。含特斯拉/Tesla 时改回中性文案。when_s 已废弃，忽略。"""
+    """订阅卡片字段：字段名/长度/默认文案一律读模块顶部 WXMSG_* 配置。
+    现网默认 phrase1（≤5）+ thing12（≤20）；第三行场景说明固定，不传变量。
+    含特斯拉/Tesla 时改回中性默认文案。when_s 已废弃，忽略。"""
     title = str(title or "").strip()
     if (not title) or ("特斯拉" in title) or ("tesla" in title.lower()):
-        title = "行程结束"
+        title = WXMSG_PHRASE_DEFAULT
     value = str(value or "").strip()
     if ("特斯拉" in value) or ("tesla" in value.lower()):
         value = ""
     if not value:
-        value = "行程已结束"
+        value = WXMSG_THING_DEFAULT
     return {
-        "phrase1": {"value": title[:5]},
-        "thing12": {"value": value[:20]},
+        WXMSG_FIELD_PHRASE: {"value": title[:WXMSG_PHRASE_MAX]},
+        WXMSG_FIELD_THING: {"value": value[:WXMSG_THING_MAX]},
     }
 
 
@@ -3626,7 +3649,7 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
             return
         data = self._parse_json() or {}
         uid = str(data.get("uid") or "")
-        title = str(data.get("title") or "行程结束")
+        title = str(data.get("title") or WXMSG_PHRASE_DEFAULT)
         value = str(data.get("value") or "")
         page = data.get("page") or "pages/home/home"
         trip_id = str(data.get("trip_id") or "")
@@ -3658,7 +3681,7 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         self._json(200, body)
 
     def _api_wxmsg_accept(self):
-        """小程序在「开始行程」点击里 wx.requestSubscribeMessage 之后上报。
+        """小程序在「行程回顾 / 行程详情」里 wx.requestSubscribeMessage 之后上报。
         body: {token? 或 Authorization Bearer, tmpl?, trip_id?, result: accept|reject|ban, openid?}
         openid 必须已由 mp_login 绑到会话 uid；若 body 带了 openid，只做一致性校验，不回传。
         个人主体一次性订阅：accept 一次该模板 +1，发送成功再 -1。"""
@@ -3679,7 +3702,7 @@ class Handler(EmailAuthEndpoints, BaseHTTPRequestHandler):
         uid = sess["uid"]
         tmpl = str(data.get("tmpl") or WXMSG_TRIP_TMPL).strip()
         if tmpl != WXMSG_TRIP_TMPL:
-            self._json(400, {"ok": False, "error": "仅支持行程完成一次性模板"})
+            self._json(400, {"ok": False, "error": "仅支持当前配置的行程一次性模板"})
             return
         result = str(data.get("result") or "").strip().lower()
         if result not in ("accept", "reject", "ban"):
