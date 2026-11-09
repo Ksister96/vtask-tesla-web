@@ -657,16 +657,30 @@ def settle_trip(uid, seg):
                 {"type": "trip_detail", "trip_id": detail["id"]})
     except Exception:
         pass
-    # 订阅消息（2026-10-24）：用户授权过则微信通知，失败静默
+    # 一次性订阅：行程真正结束才发。失败只记日志，不打断 settle。
     try:
         req = urllib.request.Request(
             "http://127.0.0.1:8794/internal/wxmsg",
-            data=json.dumps({"uid": uid, "title": "行程完成",
-                             "value": "%.1f km · %d 分钟" % (_dist, _dur_s / 60)}).encode("utf-8"),
+            data=json.dumps({
+                "uid": uid,
+                "title": "行程结束",
+                "value": "%.1f km · %d 分钟" % (_dist, _dur_s / 60),
+                "trip_id": detail.get("id") or "",
+            }).encode("utf-8"),
             headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5).read()
-    except Exception:
-        pass
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        try:
+            d = json.loads(raw)
+        except Exception:
+            d = {}
+        if d.get("sent"):
+            log("wxmsg 已发送 %s trip=%s" % (uid, detail.get("id") or "-"))
+        else:
+            log("wxmsg 未发出 %s trip=%s reason=%s err=%s" % (
+                uid, detail.get("id") or "-", d.get("reason"), d.get("errcode")))
+    except Exception as e:
+        log("wxmsg 推送异常 %s %s" % (uid, e))
     log("%s 行程结算 %s %.1fkm %d分钟" % (uid, detail["id"], _dist, _dur_s / 60))
 
 
