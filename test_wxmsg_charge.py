@@ -25,21 +25,32 @@ assert CAR.WXMSG_CHARGE_FIELD_END == "time2"
 
 START = time.mktime(time.strptime("2026-11-10 01:00", "%Y-%m-%d %H:%M"))
 END = time.mktime(time.strptime("2026-11-10 03:30", "%Y-%m-%d %H:%M"))
-RANGE = "2026-11-10 01:00~2026-11-10 03:30"
+# 01:00→03:30 = 2 小时 30 分，time3 是时长不是时段
+DUR_2H30 = "02:30:00"
 
 
 def card(**kw):
     return CAR.wxmsg_charge_payload(kw.pop("start_ts", START), kw.pop("end_ts", END), **kw)
 
 
-# kWh、半角 ~ 时段、结束时间；禁止把「35分钟」填进 time
+# kWh、HH:MM:SS 时长、结束时间；禁止把「35分钟」或「开始~结束」填进 time3
 p = card(kwh=25.8)
-assert p["time3"]["value"] == RANGE, p
+assert p["time3"]["value"] == DUR_2H30, p
 assert p["time2"]["value"] == "2026-11-10 03:30", p
 assert p["character_string4"]["value"] == "25.8kWh", p
-assert "～" not in p["time3"]["value"] and "~" in p["time3"]["value"]
+assert "~" not in p["time3"]["value"] and "～" not in p["time3"]["value"]
 assert "分钟" not in json.dumps(p, ensure_ascii=False)
-assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}~\d{4}-\d{2}-\d{2} \d{2}:\d{2}", p["time3"]["value"])
+assert re.fullmatch(r"\d{2,}:\d{2}:\d{2}", p["time3"]["value"])
+# 1 小时 18 分 → 01:18:00（对齐模板示例 17:00:42 的 HH:MM:SS）
+h18 = CAR.wxmsg_charge_payload(START, START + 3600 + 18 * 60, kwh=1)
+assert h18["time3"]["value"] == "01:18:00", h18
+assert h18["time2"]["value"] == time.strftime("%Y-%m-%d %H:%M", time.localtime(START + 3600 + 18 * 60))
+# 跨天按总秒数，小时可以超过 24
+over = CAR.wxmsg_charge_payload(START, START + 25 * 3600 + 3 * 60 + 4, kwh=1)
+assert over["time3"]["value"] == "25:03:04", over
+# 结束早于开始：时长归零，不出现负号
+back = CAR.wxmsg_charge_payload(END, START, kwh=1)
+assert back["time3"]["value"] == "00:00:00", back
 
 # 剥汉字：度 / 分钟都不能留在 character_string
 p = card(kwh="25.8度")
@@ -47,7 +58,7 @@ assert p["character_string4"]["value"] == "25.8kWh", p
 assert not re.search(r"[\u4e00-\u9fff]", p["character_string4"]["value"])
 p = card(kwh="35分钟")
 assert p["character_string4"]["value"] == "35.0kWh", p
-assert p["time3"]["value"] == RANGE
+assert p["time3"]["value"] == DUR_2H30
 assert "分钟" not in p["time3"]["value"] and "分钟" not in p["character_string4"]["value"]
 
 # 缺能量用 SOC 差；都没有用 0kWh；显式 0 仍是 kWh 不是百分比
@@ -59,13 +70,15 @@ p = card()
 assert p["character_string4"]["value"] == "0kWh", p
 p = card(kwh=0)
 assert p["character_string4"]["value"] == "0.0kWh", p
+# 缺 start_ts：time3 固定 00:00:00，不退回结束时间点（结束钟点仍只放 time2）
 p = card(start_ts=None)
-assert p["time3"]["value"] == "2026-11-10 03:30", p
+assert p["time3"]["value"] == "00:00:00", p
+assert p["time2"]["value"] == "2026-11-10 03:30", p
 assert "~" not in p["time3"]["value"]
 
-# 毫秒时间戳同样能拼时段；超长电量截到 32 且无汉字
+# 毫秒时间戳同样能算时长；超长电量截到 32 且无汉字
 p = CAR.wxmsg_charge_payload(START * 1000, END * 1000, kwh=25.8)
-assert p["time3"]["value"] == RANGE, p
+assert p["time3"]["value"] == DUR_2H30, p
 p = card(kwh="汉" * 10 + "123456789012345678901234567890999kWh多余")
 assert len(p["character_string4"]["value"]) <= 32
 assert not re.search(r"[\u4e00-\u9fff]", p["character_string4"]["value"])
@@ -185,7 +198,7 @@ assert first.resp[1]["sent"] is True, first.resp
 assert len(first.sent) == 1
 sent = first.sent[0]
 assert sent["tmpl"] == TMPL, sent
-assert sent["data"]["time3"]["value"] == RANGE
+assert sent["data"]["time3"]["value"] == DUR_2H30
 assert sent["data"]["character_string4"]["value"] == "25.8kWh"
 assert sent["data"]["time2"]["value"] == "2026-11-10 03:30"
 assert "分钟" not in json.dumps(sent["data"], ensure_ascii=False)

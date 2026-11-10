@@ -760,19 +760,32 @@ def _wxmsg_charge_energy(kwh, soc_delta, max_len=None):
     return energy[:max_len] or "0kWh"
 
 
+def _wxmsg_hms(total_seconds):
+    """总秒数 → HH:MM:SS。小时至少两位，可以超过 24。负数当 0。"""
+    try:
+        total = int(round(float(total_seconds)))
+    except (TypeError, ValueError):
+        total = 0
+    if total < 0:
+        total = 0
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return "%02d:%02d:%02d" % (hours, minutes, seconds)
+
+
 def wxmsg_charge_payload(start_ts, end_ts, kwh=None, soc_delta=None, now=None):
-    """充电结束通知字段。time3 只能是时间点或「开始~结束」，禁止「35分钟」。
+    """充电结束通知字段。time3 是充电时长 HH:MM:SS（结束−开始），对齐模板示例 17:00:42。
+    禁止「35分钟」和「开始~结束」。缺 start_ts 时 time3 固定 00:00:00，不退回结束钟点。
     character_string4 无汉字。场景说明不在这里发。"""
     end_epoch = _wxmsg_epoch(end_ts)
     if end_epoch is None:
         end_epoch = _wxmsg_epoch(now) or time.time()
     start_epoch = _wxmsg_epoch(start_ts)
     end_s = time.strftime("%Y-%m-%d %H:%M", time.localtime(end_epoch))
-    if start_epoch is not None:
-        start_s = time.strftime("%Y-%m-%d %H:%M", time.localtime(start_epoch))
-        duration = "%s~%s" % (start_s, end_s)
+    if start_epoch is None:
+        duration = "00:00:00"
     else:
-        duration = end_s
+        duration = _wxmsg_hms(end_epoch - start_epoch)
     energy = _wxmsg_charge_energy(kwh, soc_delta)
     return {
         WXMSG_CHARGE_FIELD_DURATION: {"value": duration},
