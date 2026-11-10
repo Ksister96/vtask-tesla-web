@@ -77,10 +77,59 @@ def sys_msg(uid, text, card=None):
         log(f"{uid} sys_msg err: {e}")
 
 
+def _charge_num(v):
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _charge_epoch_seconds(v):
+    """秒或毫秒时间戳 → 秒。无效返回 None。"""
+    n = _charge_num(v)
+    if n is None or n <= 0:
+        return None
+    if n > 1e12:
+        n = n / 1000.0
+    return n
+
+
+def post_charge_wxmsg(uid, payload):
+    """充电结束 → 本机 car-web 发一次性订阅。失败只记日志，调用方不因此中断聊天。
+    只打 127.0.0.1，绝不 wake_up。"""
+    url = os.environ.get("WXMSG_INTERNAL_URL", "http://127.0.0.1:8794/internal/wxmsg")
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        log(f"{uid} charge wxmsg err: {e}")
+
+
+def _charge_end_reason(cur):
+    """结束原因只进内部 body，不进微信模板。空状态记 ended。"""
+    known = {
+        "Complete": "complete",
+        "Stopped": "stopped",
+        "Disconnected": "disconnected",
+        "NoPower": "nopower",
+    }
+    if cur in known:
+        return known[cur]
+    token = re.sub(r"[^A-Za-z0-9_]+", "", str(cur or "")).lower()
+    return token or "ended"
+
+
 def charge_watch(uid, cs):
     """充电完成 / 低电量 → 聊天流系统消息（2026-10-23）。
     状态存 users/<uid>/charge_watch.json 跨轮记忆；泊车驻车轮次也会走到这里
-    （poll_user 在驻车早退之前调用本函数，充电过夜同样能感知）。"""
+    （poll_user 在驻车早退之前调用本函数，充电过夜同样能感知）。
+    微信：上一轮 Charging → 本轮不再充电（Complete / Stopped / Disconnected / NoPower 等）发一次。
+    同一会话只发一次。低电量、充电开始不发微信。聊天「充电完成」仍只在 Complete。"""
     try:
         cur = (cs or {}).get("charging_state") or ""
         soc = (cs or {}).get("battery_level")
@@ -94,15 +143,47 @@ def charge_watch(uid, cs):
         pstate = prev.get("state") or ""
         today = time.strftime("%Y%m%d")
         msg = None
-        new = {"state": cur, "since": prev.get("since"), "low_day": prev.get("low_day") or ""}
+        wx_body = None
+        new = {"state": cur, "since": prev.get("since"), "low_day": prev.get("low_day") or "",
+               "soc0": prev.get("soc0"), "energy0": prev.get("energy0")}
         if cur == "Charging" and pstate != "Charging":
             new["since"] = time.time()
+            new["soc0"] = _charge_num(soc)
+            new["energy0"] = _charge_num((cs or {}).get("charge_energy_added"))
+        # Starting 仍在充电流程里，不算结束。其余离开 Charging 的状态都算充电结束。
+        charge_ended = pstate == "Charging" and cur not in ("Charging", "Starting")
         if pstate == "Charging" and cur == "Complete":
             m = int(max(0, time.time() - (new.get("since") or time.time())) // 60)
             dur = f"，用时 {m // 60}小时{m % 60:02d}分" if m >= 60 else (f"，用时 {m} 分钟" if m > 0 else "")
             rng = (cs or {}).get("battery_range")
             rng_s = f"，续航约 {round(float(rng) * 1.609344)} km" if rng else ""
             msg = f"🔌 充电完成：当前 {soc}%{rng_s}{dur}"
+        if charge_ended:
+            start_ts = _charge_epoch_seconds(new.get("since"))
+            end_ts = _charge_epoch_seconds((cs or {}).get("sample_ts")) or time.time()
+            added = _charge_num((cs or {}).get("charge_energy_added"))
+            base = _charge_num(new.get("energy0"))
+            kwh = None
+            if added is not None and base is not None:
+                kwh = max(0.0, added - base)
+            elif added is not None:
+                kwh = max(0.0, added)
+            soc_end = _charge_num(soc)
+            soc0 = _charge_num(new.get("soc0"))
+            anchor = start_ts or end_ts
+            wx_body = {
+                "uid": uid,
+                "kind": "charge",
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "soc_start": soc0,
+                "soc_end": soc_end,
+                "end_reason": _charge_end_reason(cur),
+                # 同一 since 永远得到同一个键；毫秒只为了相邻两次开充不被压成同一秒
+                "session_id": str(int(round(anchor * 1000))),
+            }
+            if kwh is not None:
+                wx_body["kwh"] = round(kwh, 3)
         if soc is not None and cur != "Charging" and soc < 20 and new["low_day"] != today:
             msg = f"🔋 电量只剩 {soc}%，记得找桩充电"
             new["low_day"] = today
@@ -114,6 +195,11 @@ def charge_watch(uid, cs):
         if msg:
             sys_msg(uid, msg)
             log(f"{uid} 车况提醒: {msg}")
+        if wx_body:
+            try:
+                post_charge_wxmsg(uid, wx_body)
+            except Exception as e:
+                log(f"{uid} charge wxmsg err: {e}")
     except Exception as e:
         log(f"{uid} charge_watch err: {e}")
 

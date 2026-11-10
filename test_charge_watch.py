@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""charge_watch 状态机回归（2026-10-23 通知中心）：完成推送 / 低电一天一次 / 不重复打扰。"""
+"""charge_watch 状态机回归（2026-10-23 通知中心）：完成推送 / 低电一天一次 / 不重复打扰。
+另：充电结束微信在 Charging→任何结束状态发一次（充满/中断/拔枪）；重复结束不双发；低电量、开始充电不发。"""
 import json
 import os
 import sys
@@ -11,10 +12,19 @@ os.makedirs(os.path.join(TMP, "users", "t1"))
 sys.path.insert(0, "/opt/tesla-fleet-multi")
 import track_watcher_multi as tw  # noqa: E402
 
+wx_posts = []
 
-def chat():
+
+def _record_wx(uid, payload):
+    wx_posts.append((uid, payload))
+
+
+tw.post_charge_wxmsg = _record_wx
+
+
+def chat(uid="t1"):
     try:
-        return json.load(open(os.path.join(TMP, "users", "t1", "chat.json"), encoding="utf-8"))
+        return json.load(open(os.path.join(TMP, "users", uid, "chat.json"), encoding="utf-8"))
     except Exception:
         return []
 
@@ -44,5 +54,76 @@ assert len(chat()) == 3 and "充电完成" in chat()[-1]["text"], chat()
 # 7) sys_msg 直写
 tw.sys_msg("t1", "🧪 直写测试")
 assert chat()[-1]["text"] == "🧪 直写测试" and chat()[-1]["who"] == "sys"
+
+# 8) 微信：两段完成各发一次；完成态停留、低电量都不发
+assert len(wx_posts) == 2, wx_posts
+assert all(p[0] == "t1" and p[1].get("kind") == "charge" and p[1].get("end_reason") == "complete"
+           and p[1].get("session_id") for p in wx_posts), wx_posts
+
+# 9) 充满发一次且重复 Complete 不双发；Stopped / Disconnected / NoPower 各发一次，重复结束不双发
+os.makedirs(os.path.join(TMP, "users", "t2"))
+n = len(wx_posts)
+tw.charge_watch("t2", {"charging_state": "Charging", "battery_level": 41.6, "charge_energy_added": 1.2})
+tw.charge_watch("t2", {
+    "charging_state": "Complete", "battery_level": 80, "charge_energy_added": 27.0,
+    "sample_ts": 1790000000000,
+})
+assert len(wx_posts) == n + 1, wx_posts
+body = wx_posts[-1][1]
+assert body["kind"] == "charge" and body["end_reason"] == "complete", body
+assert body["kwh"] == 25.8, body
+assert body["soc_start"] == 41.6 and body["soc_end"] == 80, body
+assert body["end_ts"] == 1790000000, body
+assert body["session_id"] and "分钟" not in json.dumps(body, ensure_ascii=False)
+sess = body["session_id"]
+tw.charge_watch("t2", {"charging_state": "Complete", "battery_level": 80, "charge_energy_added": 27.0})
+tw.charge_watch("t2", {"charging_state": "Stopped", "battery_level": 80, "charge_energy_added": 27.0})
+assert len(wx_posts) == n + 1, wx_posts
+tw.charge_watch("t2", {"charging_state": "Charging", "battery_level": 50, "charge_energy_added": 0})
+tw.charge_watch("t2", {"charging_state": "Starting", "battery_level": 50, "charge_energy_added": 0.1})
+assert len(wx_posts) == n + 1, wx_posts
+tw.charge_watch("t2", {"charging_state": "Charging", "battery_level": 50, "charge_energy_added": 0})
+tw.charge_watch("t2", {"charging_state": "Stopped", "battery_level": 55, "charge_energy_added": 3.2})
+assert len(wx_posts) == n + 2, wx_posts
+stopped = wx_posts[-1][1]
+assert stopped["kind"] == "charge" and stopped["end_reason"] == "stopped", stopped
+assert stopped["kwh"] == 3.2 and stopped["session_id"] and stopped["session_id"] != sess, stopped
+tw.charge_watch("t2", {"charging_state": "Stopped", "battery_level": 55, "charge_energy_added": 3.2})
+tw.charge_watch("t2", {"charging_state": "Complete", "battery_level": 55, "charge_energy_added": 3.2})
+assert len(wx_posts) == n + 2, wx_posts
+tw.charge_watch("t2", {"charging_state": "Charging", "battery_level": 55, "charge_energy_added": 3.2})
+tw.charge_watch("t2", {"charging_state": "Disconnected", "battery_level": 56, "charge_energy_added": 3.4})
+assert len(wx_posts) == n + 3, wx_posts
+assert wx_posts[-1][1]["end_reason"] == "disconnected" and wx_posts[-1][1]["kind"] == "charge"
+tw.charge_watch("t2", {"charging_state": "Disconnected", "battery_level": 56})
+assert len(wx_posts) == n + 3, wx_posts
+tw.charge_watch("t2", {"charging_state": "Charging", "battery_level": 40, "charge_energy_added": 0})
+tw.charge_watch("t2", {"charging_state": "NoPower", "battery_level": 40, "charge_energy_added": 0.4})
+assert len(wx_posts) == n + 4, wx_posts
+assert wx_posts[-1][1]["end_reason"] == "nopower" and wx_posts[-1][1]["kwh"] == 0.4
+tw.charge_watch("t2", {"charging_state": "NoPower", "battery_level": 40})
+assert len(wx_posts) == n + 4, wx_posts
+tw.charge_watch("t2", {"charging_state": "Charging", "battery_level": 40, "charge_energy_added": 1})
+tw.charge_watch("t2", {"charging_state": "", "battery_level": 40, "charge_energy_added": 1.5})
+assert len(wx_posts) == n + 5, wx_posts
+assert wx_posts[-1][1]["end_reason"] == "ended" and wx_posts[-1][1]["kind"] == "charge"
+tw.charge_watch("t2", {"charging_state": "", "battery_level": 12})
+assert len(wx_posts) == n + 5, wx_posts
+done = [m for m in chat("t2") if "充电完成" in m.get("text", "")]
+assert len(done) == 1, chat("t2")
+assert any("12%" in m.get("text", "") for m in chat("t2"))
+
+# 10) 微信发送失败不打断「充电完成」聊天
+os.makedirs(os.path.join(TMP, "users", "t3"))
+
+
+def _boom(uid, payload):
+    raise RuntimeError("wx down")
+
+
+tw.post_charge_wxmsg = _boom
+tw.charge_watch("t3", {"charging_state": "Charging", "battery_level": 30, "charge_energy_added": 0})
+tw.charge_watch("t3", {"charging_state": "Complete", "battery_level": 70, "charge_energy_added": 10, "battery_range": 100})
+assert any("充电完成" in m.get("text", "") and "70%" in m.get("text", "") for m in chat("t3")), chat("t3")
 
 print("CHARGE_WATCH_TESTS_PASS")
