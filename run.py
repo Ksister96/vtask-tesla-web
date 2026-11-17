@@ -549,27 +549,59 @@ def action_cn(action):
 
 
 
-def get_weather(city="Shanghai"):
-    """获取天气（wttr.in，国内可达），带 10 分钟缓存。失败返回 None，不影响主流程。"""
-    now = time.time()
-    try:
-        if os.path.exists(WEATHER_CACHE):
-            c = json.load(io_open(WEATHER_CACHE, encoding="utf-8"))
-            if now - c.get("ts", 0) < WEATHER_CACHE_TTL and c.get("data"):
-                return c["data"]
-    except Exception:
-        pass
+# open-meteo WMO weather code -> 中文描述
+WMO_CN = {
+    0: "晴", 1: "晴间多云", 2: "多云", 3: "阴",
+    45: "雾", 48: "冻雾", 51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
+    56: "冻毛毛雨", 57: "强冻毛毛雨", 61: "小雨", 63: "中雨", 65: "大雨",
+    66: "冻雨", 67: "强冻雨", 71: "小雪", 73: "中雪", 75: "大雪",
+    77: "雪粒", 80: "小阵雨", 81: "阵雨", 82: "强阵雨", 85: "小阵雪",
+    86: "大阵雪", 95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "强雷暴伴冰雹",
+}
+
+
+def _weather_open_meteo(city="Shanghai", timeout=5, lat=None, lon=None):
+    """主源：open-meteo（免 key、免费、国内及海外均可达）。失败返回 None。
+    2026-10-24 支持按经纬度查询（车辆遥测位置跟随）：传 lat/lon 即用之。"""
+    if lat is None or lon is None:
+        lat, lon = 31.2304, 121.4737  # 上海默认
+    url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+           "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
+           "weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min"
+           "&timezone=Asia%%2FShanghai&forecast_days=1" % (lat, lon))
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        d = json.loads(resp.read().decode("utf-8", errors="replace"))
+    cur = d.get("current") or {}
+    daily = d.get("daily") or {}
+    code = cur.get("weather_code")
+    maxt = (daily.get("temperature_2m_max") or [None])[0]
+    mint = (daily.get("temperature_2m_min") or [None])[0]
+    return {
+        "city": "上海",
+        "temp": None if cur.get("temperature_2m") is None else str(round(cur.get("temperature_2m"))),
+        "feels": None if cur.get("apparent_temperature") is None else str(round(cur.get("apparent_temperature"))),
+        "weather": WMO_CN.get(code, "") if code is not None else "",
+        "humidity": None if cur.get("relative_humidity_2m") is None else str(round(cur.get("relative_humidity_2m"))),
+        "wind": None if cur.get("wind_speed_10m") is None else str(round(cur.get("wind_speed_10m"))),
+        "maxt": None if maxt is None else str(round(maxt)),
+        "mint": None if mint is None else str(round(mint)),
+    }
+
+
+def _weather_wttr(city="Shanghai", timeout=5):
+    """备用源：wttr.in（本机可用；香港云机不通时由 open-meteo 兜住）。失败返回 None。"""
     try:
         url = f"https://wttr.in/{city}?format=j1"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             d = json.loads(resp.read().decode("utf-8", errors="replace"))
         cur = d["current_condition"][0]
         desc = cur.get("weatherDesc") or [{}]
         today = d.get("weather", [{}])[0]
         area = (d.get("nearest_area") or [{}])[0].get("areaName", [{}])[0].get("value", city)
         city_cn = "上海" if str(city).lower() in ("shanghai",) or "poon" in str(area).lower() else area
-        data = {
+        return {
             "city": city_cn,
             "temp": cur.get("temp_C"),
             "feels": cur.get("FeelsLikeC"),
@@ -579,13 +611,47 @@ def get_weather(city="Shanghai"):
             "maxt": today.get("maxtempC"),
             "mint": today.get("mintempC"),
         }
-        try:
-            io_open(WEATHER_CACHE, "w", encoding="utf-8").write(json.dumps({"ts": now, "data": data}, ensure_ascii=False))
-        except Exception:
-            pass
-        return data
     except Exception:
         return None
+
+
+def get_weather(city="Shanghai", lat=None, lon=None):
+    """获取天气（双源：open-meteo 主 / wttr.in 备），带 10 分钟缓存。
+
+    ⚠️ 迁移香港云机后 wttr.in 直连不通（曾导致每条车控指令干等 15s 超时）。
+    改为 open-meteo 优先（超时 5s），两源都失败也快速返回 None，不拖慢主链路。
+    2026-10-24 支持车辆位置跟随：传 lat/lon 按车所在地查询；缓存按坐标近似匹配
+    （0.05°≈5km 内复用，车开远了自动换新）。不传坐标时仍按城市默认（上海）。
+    """
+    now = time.time()
+    try:
+        if os.path.exists(WEATHER_CACHE):
+            with io_open(WEATHER_CACHE, encoding="utf-8") as f:
+                c = json.load(f)
+            near = (lat is None and c.get("lat") is None) or (
+                lat is not None and c.get("lat") is not None
+                and abs(c["lat"] - lat) < 0.05 and abs(c.get("lon", lon) - lon) < 0.05)
+            if now - c.get("ts", 0) < WEATHER_CACHE_TTL and c.get("data") and near:
+                return c["data"]
+    except Exception:
+        pass
+    data = None
+    for _fn in ((lambda: _weather_open_meteo(city, lat=lat, lon=lon)), (lambda: _weather_wttr(city))):
+        try:
+            data = _fn()
+        except Exception:
+            data = None
+        if data:
+            break
+    if not data:
+        return None
+    try:
+        with io_open(WEATHER_CACHE, "w", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"ts": now, "data": data, "lat": lat, "lon": lon}, ensure_ascii=False))
+    except Exception:
+        pass
+    return data
 
 
 def weather_advice(w):
