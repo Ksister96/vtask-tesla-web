@@ -2,6 +2,8 @@
 """Tesla 车控意图匹配器：自然语言 -> {action, params} JSON
 
 用 GLM 大模型把用户自然语言映射到官方命令集。
+2026-10-23 改直连智谱官方（teamorouter 第三方路由失效，key 401 多月）：
+glm-4-flash 个人免费档，主备均为免费模型，key 失效时上层自动退回本地规则。
 输入: 自然语言（命令行参数或 stdin）
 输出: {"action": "...", "params": {...}} 或 {"error": "..."}
 """
@@ -10,9 +12,9 @@ import os
 import sys
 import urllib.request
 
-API_URL = "https://api.teamorouter.cn/v1/chat/completions"
-MODEL = "glm-5.3-flash-free"
-MODEL_FALLBACK = "glm-5.3-flash"   # 福利版402限流时自动兜底（付费，单价极低）
+API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+MODEL = "glm-4-flash"
+MODEL_FALLBACK = "glm-4.5-flash"   # 均为智谱免费档；主模型限流/过载时自动兜底
 API_KEY = os.environ.get("VECTIDE_API_KEY", "")
 
 ACTIONS = """可用动作清单（JSON 的 action 字段必须是这些之一，全小写下划线）：
@@ -59,6 +61,8 @@ ACTIONS = """可用动作清单（JSON 的 action 字段必须是这些之一，
 
 SYSTEM = """你是特斯拉车控命令解析器。把用户的中文自然语言指令转换为结构化命令。
 只输出一个 JSON 对象，必须包含 "actions" 数组（即使只有单个动作），不要输出任何其他文字。
+只解析用户明确说出的车辆操作；像「准备一下」「收拾一下」这类泛化请求不要臆测动作，
+不确定时返回 {"error": "无法识别意图"}。
 
 %s
 
@@ -102,7 +106,7 @@ def call_llm(user_text: str) -> dict:
         except urllib.error.HTTPError as e:
             last_err = f"HTTP Error {e.code}"
             if e.code in (402, 429, 500, 502, 503):
-                continue   # 福利版限流/过载 → 付费版兜底
+                continue   # 主模型限流/过载 → 免费档兜底
             return {"error": f"API调用失败: {e}"}
         except Exception as e:
             return {"error": f"API调用失败: {e}"}

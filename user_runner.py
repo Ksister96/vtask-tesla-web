@@ -63,6 +63,8 @@ ALLOWED_ACTIONS = {
     "media_toggle_playback", "media_next_track", "media_prev_track",
     "adjust_volume", "speed_limit_set_limit", "trigger_homelink",
     "status",
+    # 查询类五件套（2026-10-23 P1）：本地规则直答，不走车控代理
+    "location_query", "tire_query", "trip_query", "charge_eta_query", "help_query",
 }
 
 # 绝对禁止（官方最危险操作，任何用户都不能碰）
@@ -696,7 +698,7 @@ def fmt_report(uid, vin, ok, action, detail="", v=None, w=None):
             lines.append(f"🚗 电量 {bats}% | 续航 {rng_s} | 锁定 {lock_s} | 车内 {in_s}")
     if st.get("replyShowWeather", True):
         if w is None:
-            w = _owner.get_weather()
+            w = _weather_for_car(vin)
         if w:
             t = w.get("temp") or "?"
             f = w.get("feels") or t
@@ -859,7 +861,7 @@ _LOCAL_FULL_RULES = [
     (("开空调", "打开空调", "空调打开", "开冷气", "开冷风", "开暖风", "开热风", "制冷", "制热"), "auto_conditioning_start", {}),
     (("关空调", "关闭空调", "空调关掉", "关冷气", "关暖风"), "auto_conditioning_stop", {}),
     (("开方向盘加热", "打开方向盘加热", "方向盘加热打开", "方向盘加热"), "remote_steering_wheel_heater_request", {"on": True}),
-    (("充电"), "charge_start", {}),
+    (("充电", "充会儿电"), "charge_start", {}),
     (("关方向盘加热", "关闭方向盘加热", "方向盘加热关掉"), "remote_steering_wheel_heater_request", {"on": False}),
     (("开车窗通风", "车窗通风"), "window_control", {"command": "vent"}),
 ]
@@ -1002,6 +1004,27 @@ def resolve_actions(user_text):
         if _n:
             return [{"action": "set_charge_limit",
                      "params": {"percent": max(50, min(100, _n))}}], None
+    # 查询类五件套（2026-10-23 P1）：找车/胎压/行程/充电进度/帮助 —— 本地正则直答不进 LLM；
+    # 含复合连接词/分隔符的句子不劫持，照走原解析链路。
+    # 「查行程/看行程/我的行程」并入 last_trip（2026-10-25）。
+    _t_q = _t_cl or ""
+    if _t_q and not any(w in _t_q for w in ("然后", "接着", "并且", "而且", "还有", "同时", "顺便", "以及", "加上")) \
+            and not any(c in _t_q for c in "，,、;；"):
+        if any(w in _t_q for w in ("车在哪", "车停哪", "车的位置", "车位置", "定位一下车", "看一下车在哪", "看看车在哪")):
+            return [{"action": "location_query", "params": {}}], None
+        if "胎压" in _t_q:
+            return [{"action": "tire_query", "params": {}}], None
+        if any(w in _t_q for w in ("最近一次行程", "最近的行程", "最近行程", "上次行程", "最近一次开车", "上次开车", "查行程", "看行程", "我的行程")):
+            return [{"action": "trip_query", "params": {"scope": "last_trip"}}], None
+        if any(w in _t_q for w in ("上周开", "上周跑", "上周行", "上周里程", "上周行程", "这周开", "这周跑", "本周开", "本周跑", "这周里程", "本周里程")):
+            scope = "last_week" if "上周" in _t_q else "this_week"
+            return [{"action": "trip_query", "params": {"scope": scope}}], None
+        if any(w in _t_q for w in ("昨天开", "昨天跑", "昨天去", "昨天行")):
+            return [{"action": "trip_query", "params": {"scope": "yesterday"}}], None
+        if any(w in _t_q for w in ("还要多久", "多久充满", "充电进度", "充到哪了", "充满还要")):
+            return [{"action": "charge_eta_query", "params": {}}], None
+        if any(w in _t_q for w in ("你能做什么", "能做什么", "都会什么", "会什么", "怎么用", "使用帮助", "功能清单")):
+            return [{"action": "help_query", "params": {}}], None
     # [fix 2026-10-22] ASR 常在中文词间插空格（「空调 开到 22 度」）：空格把整句撕成片段，
     # 被误判复合后温度匹配失败、落入 LLM（key 失效即引导文案）。单动作温度句先按去空格
     # 整句匹配（与上方充电限制同思路）；含连接词/分隔符的复合句不劫持，照走原解析。
@@ -1122,6 +1145,82 @@ def describe_action(item):
     return base
 
 
+def _vin_archive(vin):
+    """VIN 档案（track_watcher/遥测写入的最新位置+胎压）。无数据返回 {}。"""
+    try:
+        return json.load(open(os.path.join(USERS_DIR, "vehicles", f"{vin}.json"), encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _amap_regeo(lat, lon):
+    """高德逆地理：坐标 → 地址。失败返回 None。（与 track_watcher.regeo 同款）"""
+    try:
+        key = open(os.path.join(MULTI_BASE, "amap_key.txt"), encoding="utf-8-sig").read().strip()
+    except Exception:
+        return None
+    if not key:
+        return None
+    try:
+        url = "https://restapi.amap.com/v3/geocode/regeo?location=%s,%s&key=%s" % (lon, lat, key)
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+        if str(d.get("status")) == "1":
+            return (d.get("regeocode") or {}).get("formatted_address") or None
+    except Exception:
+        return None
+    return None
+
+
+_WX_CITY_CACHE = {}
+
+
+def _weather_for_car(vin):
+    """天气跟车走（2026-10-24）：按车辆遥测位置查车所在地天气，城市名取高德逆地理；
+    无位置或失败时回退默认（上海）。城市名 30 分钟缓存。"""
+    arch = _vin_archive(vin)
+    lat, lon = arch.get("latitude"), arch.get("longitude")
+    if lat is None or lon is None:
+        return _owner.get_weather()
+    try:
+        w = _owner.get_weather(lat=round(float(lat), 4), lon=round(float(lon), 4))
+    except Exception:
+        w = None
+    if not w:
+        return _owner.get_weather()
+    key = (round(float(lat), 2), round(float(lon), 2))
+    hit = _WX_CITY_CACHE.get(key)
+    if hit and time.time() - hit[0] < 1800:
+        w["city"] = hit[1]
+        return w
+    try:
+        keyf = open(os.path.join(MULTI_BASE, "amap_key.txt"), encoding="utf-8-sig").read().strip()
+        url = "https://restapi.amap.com/v3/geocode/regeo?location=%s,%s&key=%s" % (lon, lat, keyf)
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+        comp = ((d.get("regeocode") or {}).get("addressComponent") or {}) if str(d.get("status")) == "1" else {}
+        city = comp.get("city") or comp.get("province") or ""
+        if isinstance(city, list):
+            city = city[0] if city else ""
+        if city:
+            _WX_CITY_CACHE[key] = (time.time(), city)
+            w["city"] = city
+    except Exception:
+        pass
+    return w
+
+
+HELP_TEXT = """我能听懂这些（打字或按住语音说都行）：
+• 控制：锁车/解锁、闪灯/鸣笛、后备箱/前备箱、哨兵开/关
+• 空调：开空调/关空调、「空调调到23度」、座椅加热/通风、方向盘加热
+• 充电：开始/停止充电、「充电到80」、定时充电
+• 查询：「查车况」「胎压正常吗」「车在哪」「充电还要多久」「上周开了多少公里」
+• 场景：说场景名一键执行（设置 → 一键场景 里创建）
+• 定时：「明早7点开空调」，取消说「取消定时」"""
+
+
 def run_text(uid, user_text):
     """给用户的自然语言指令做主链路（与 run.py main 对齐，但走用户 token/VIN）。"""
     vid = get_vin(uid)
@@ -1163,7 +1262,7 @@ def run_text(uid, user_text):
             lines = [f"🚗 电量 {bats}% | 续航 {rng_s} | 锁定 {lock_cn} | 状态 {state_cn}",
                      f"🌡️ 车内 {in_s} / 车外 {out_s} | 充电 {charge_cn}"]
             if st.get("replyShowWeather", True):
-                w = _owner.get_weather()
+                w = _weather_for_car(vin)
                 if w:
                     t = w.get("temp") or "?"
                     f = w.get("feels") or t
@@ -1173,6 +1272,112 @@ def run_text(uid, user_text):
                         if adv:
                             lines.append(f"💡 {adv}")
             return "\n".join(lines)
+        # ---- 查询类五件套（2026-10-23 P1）：读本地数据直答，不碰车控代理 ----
+        if action == "location_query":
+            arch = _vin_archive(vin)
+            lat, lon = arch.get("latitude"), arch.get("longitude")
+            if lat is None or lon is None:
+                return "📍 还拿不到车辆位置：车辆在线上报后会自动同步，稍后再问试试"
+            addr = _amap_regeo(lat, lon)
+            upd = str(arch.get("updated") or "")
+            lines = ["📍 车辆位置：" + (addr or f"{round(float(lat), 5)}, {round(float(lon), 5)}")]
+            if upd:
+                lines.append("（定位更新于 " + (upd.split(" ")[-1][:5] or upd[:5]) + "）")
+            return "\n".join(lines)
+        if action == "tire_query":
+            tp = _vin_archive(vin).get("tire_pressure") or {}
+
+            def _bar(short):
+                raw = tp.get(short)
+                if raw is None:
+                    raw = tp.get("pressure_" + short)
+                try:
+                    return f"{float(raw):.1f}"
+                except Exception:
+                    return "?"
+            if not tp:
+                return "🛞 暂时没有胎压数据：车辆行驶后会自动上报，开一小段再来问就有啦"
+            cn = {"fl": "左前", "fr": "右前", "rl": "左后", "rr": "右后"}
+            nums = []
+            for short in ("fl", "fr", "rl", "rr"):
+                raw = tp.get(short)
+                if raw is None:
+                    raw = tp.get("pressure_" + short)
+                if raw is not None:
+                    try:
+                        nums.append(float(raw))
+                    except Exception:
+                        pass
+            low = [n for n in nums if n < 2.6]
+            head = "🛞 胎压：" + " | ".join(f"{cn[k]} {_bar(k)}bar" for k in ("fl", "fr", "rl", "rr"))
+            if low:
+                return head + f"\n⚠️ 有 {len(low)} 个低于 2.6bar，建议尽快补气"
+            return head + "\n✅ 都在正常范围（≥2.6bar）"
+        if action == "trip_query":
+            import glob as _glob
+            import time as _time
+            scope = (params or {}).get("scope") or "last_trip"
+            ddir = os.path.join(USERS_DIR, uid, "trip_details")
+            trips = []
+            for fp in _glob.glob(os.path.join(ddir, "*.json")):
+                try:
+                    d = json.load(open(fp, encoding="utf-8"))
+                    if d.get("distance_km"):
+                        trips.append(d)
+                except Exception:
+                    pass
+            if not trips:
+                return "🚗 还没有行程记录：出行后会自动采集，跑一趟再来问"
+            trips.sort(key=lambda t: str(t.get("id") or ""))
+            if scope == "last_trip":
+                t = trips[-1]
+                addr_s = (t.get("start_addr") or "").strip()[:12]
+                addr_e = (t.get("end_addr") or "").strip()[:12]
+                tail = f"，从{addr_s}到{addr_e}" if addr_s and addr_e else ""
+                return (f"🚗 最近一次行程：{t.get('date', '')} {t.get('start_time', '')}\n"
+                        f"{t.get('distance_km')} km · {t.get('duration_min')} 分钟{tail}")
+            lt = _time.localtime()
+            today0 = _time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, 0))
+            mon0 = today0 - lt.tm_wday * 86400
+            if scope == "last_week":
+                lo, hi, label = mon0 - 7 * 86400, mon0, "上周"
+            elif scope == "this_week":
+                lo, hi, label = mon0, _time.time() + 60, "本周"
+            else:
+                lo, hi, label = today0 - 86400, today0, "昨天"
+            sel = []
+            for t in trips:
+                try:
+                    ts = _time.mktime(_time.strptime(str(t.get("id") or "")[:8], "%Y%m%d"))
+                except Exception:
+                    continue
+                if lo <= ts < hi:
+                    sel.append(t)
+            if not sel:
+                return f"🚗 {label}没有行程记录"
+            km = sum(t["distance_km"] for t in sel)
+            mins = sum(t.get("duration_min") or 0 for t in sel)
+            h, mm = divmod(mins, 60)
+            dur = f"{h}小时{mm}分" if h else f"{mm} 分钟"
+            best = max(sel, key=lambda t: t["distance_km"])
+            wd = "周" + "一二三四五六日"[_time.strptime(str(best["id"])[:8], "%Y%m%d").tm_wday]
+            return (f"🚗 {label}用车：{len(sel)} 次行程 · {km:.1f} km · {dur}\n"
+                    f"🏆 最长一次 {best['distance_km']} km（{wd}）")
+        if action == "charge_eta_query":
+            v = read_vehicle(uid, vin)
+            if not v:
+                return "❌ 读车况失败，稍后再问"
+            cs = v.get("charge_state") or {}
+            soc = cs.get("battery_level")
+            lim = cs.get("charge_limit_soc")
+            lim_s = lim if lim is not None else "?"
+            if cs.get("charging_state") == "Charging":
+                m = cs.get("minutes_to_full_charge")
+                eta = f"，约 {m} 分钟充满" if isinstance(m, int) and m > 0 else ""
+                return f"⚡ 充电中：{soc}%（上限 {lim_s}%）{eta}"
+            return f"⚡ 当前没有在充电（电量 {soc}%，上限 {lim_s}%）；说「开始充电」即可启动"
+        if action == "help_query":
+            return HELP_TEXT
         # 智能温控 v2（2026-09-15）：先唤醒读真实车内温度 → 按基线21°C分档 → 执行 → 加料 → 过冲回调
         if action == "auto_conditioning_start":
             st = load_user_settings(uid)
@@ -1208,7 +1413,7 @@ def run_text(uid, user_text):
                     lock_s = "已锁" if vs2.get("locked") else "未锁"
                     lines.append(f"🚗 电量 {bats}% | 续航 {rng_s} | 锁定 {lock_s} | 车内 {in_s.replace('C', '°C')}")
             if st.get("replyShowWeather", True):
-                w = _owner.get_weather()
+                w = _weather_for_car(vin)
                 if w:
                     t = w.get("temp") or "?"
                     f = w.get("feels") or t
@@ -1236,7 +1441,7 @@ def run_text(uid, user_text):
             if set_temps_verified(uid, vin, _target):
                 learn_phrase(user_text, action, params)
                 v_after = read_vehicle(uid, vin)
-                w_after = _owner.get_weather()
+                w_after = _weather_for_car(vin)
                 return fmt_report(uid, vin, True, action, f"空调已开启，设定 {_target}°C", v_after, w_after)
             # 保底：停机态写入（09-29 定稿组合）
             proxy_command(uid, vin, "auto_conditioning_stop", {})
@@ -1248,7 +1453,7 @@ def run_text(uid, user_text):
                 return (f"❌ 设定温度失败（开启={'成功' if _ok1 else '失败'}, 设温={'成功' if _ok2 else '失败'}）："
                         f"{_t1 or _t2}")
             v_after = read_vehicle(uid, vin)
-            w_after = _owner.get_weather()
+            w_after = _weather_for_car(vin)
             return fmt_report(uid, vin, True, action, f"空调已开启，设定 {_target}°C", v_after, w_after)
 
         if action == "set_charge_limit":
@@ -1261,7 +1466,7 @@ def run_text(uid, user_text):
                 v_after = read_vehicle(uid, vin)
                 _real = ((v_after or {}).get("charge_state") or {}).get("charge_limit_soc")
                 detail = f"充电上限已设为 {int(float(_real)) if _real is not None else _pct}%"
-                return fmt_report(uid, vin, True, action, detail, v_after, _owner.get_weather())
+                return fmt_report(uid, vin, True, action, detail, v_after, _weather_for_car(vin))
             return f"❌ 设置充电上限失败：{msg or '车未响应'}"
 
         if action == "remote_seat_cooler_request" and params.get("seat_cooler_level", 0) > 0:
@@ -1277,7 +1482,7 @@ def run_text(uid, user_text):
         th = threading.Thread(target=_command)
         th.start()
         v_after = read_vehicle(uid, vin)
-        w_after = _owner.get_weather()
+        w_after = _weather_for_car(vin)
         th.join()
         ok, text = box.get("ok", False), box.get("text", "")
         if ok:
@@ -1389,7 +1594,7 @@ def run_text(uid, user_text):
         for t in threads:
             t.join()
         box["v"] = read_vehicle(uid, vin)
-        box["w"] = _owner.get_weather()
+        box["w"] = _weather_for_car(vin)
 
     th_after = threading.Thread(target=_after)
     th_after.start()
